@@ -131,6 +131,186 @@ static void LogInputTarget(const char *stage, UINT msg, HWND hWnd, POINT screenP
         GetLastError());
 }
 
+static BOOL IsModifierVk(WPARAM vk)
+{
+    return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+        vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+        vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+        vk == VK_LWIN || vk == VK_RWIN;
+}
+
+static BOOL IsPhysicalKeyVk(WPARAM vk)
+{
+    if (IsModifierVk(vk))
+        return TRUE;
+    if (vk >= VK_F1 && vk <= VK_F24)
+        return TRUE;
+
+    switch (vk)
+    {
+    case VK_BACK:
+    case VK_TAB:
+    case VK_RETURN:
+    case VK_ESCAPE:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_END:
+    case VK_HOME:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_SNAPSHOT:
+    case VK_APPS:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL HasModifierDown(const BOOL keyDown[256])
+{
+    return keyDown[VK_SHIFT] || keyDown[VK_LSHIFT] || keyDown[VK_RSHIFT] ||
+        keyDown[VK_CONTROL] || keyDown[VK_LCONTROL] || keyDown[VK_RCONTROL] ||
+        keyDown[VK_MENU] || keyDown[VK_LMENU] || keyDown[VK_RMENU] ||
+        keyDown[VK_LWIN] || keyDown[VK_RWIN];
+}
+
+static void UpdateKeyStateCache(UINT msg, WPARAM vk, BOOL keyDown[256])
+{
+    if (vk >= 256)
+        return;
+
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+        keyDown[vk] = TRUE;
+    else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+        keyDown[vk] = FALSE;
+}
+
+static void TryActivateInputTarget(HWND hWnd, UINT msg)
+{
+    if (!hWnd)
+        return;
+
+    HWND topHwnd = GetTopLevelWindow(hWnd);
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD targetThread = GetWindowThreadProcessId(hWnd, NULL);
+    BOOL attached = FALSE;
+
+    if (targetThread && targetThread != currentThread)
+        attached = AttachThreadInput(currentThread, targetThread, TRUE);
+
+    SetLastError(0);
+    BOOL bringResult = topHwnd ? BringWindowToTop(topHwnd) : FALSE;
+    BOOL foregroundResult = topHwnd ? SetForegroundWindow(topHwnd) : FALSE;
+    HWND activeResult = topHwnd ? SetActiveWindow(topHwnd) : NULL;
+    HWND focusResult = SetFocus(hWnd);
+
+    if (ShouldLogInput(msg))
+    {
+        char className[128];
+        char title[128];
+        DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+        printf("[input] activate %s target=0x%p top=0x%p class='%s' title='%s' attach=%d bring=%d foreground=%d active=0x%p focus=0x%p lastError=%lu\n",
+            InputMsgName(msg),
+            hWnd,
+            topHwnd,
+            className,
+            title,
+            attached,
+            bringResult,
+            foregroundResult,
+            activeResult,
+            focusResult,
+            GetLastError());
+    }
+
+    if (attached)
+        AttachThreadInput(currentThread, targetThread, FALSE);
+}
+
+static DWORD MouseFlagsForMessage(UINT msg)
+{
+    switch (msg)
+    {
+    case WM_LBUTTONDOWN: return MOUSEEVENTF_LEFTDOWN;
+    case WM_LBUTTONUP: return MOUSEEVENTF_LEFTUP;
+    case WM_LBUTTONDBLCLK: return MOUSEEVENTF_LEFTDOWN;
+    case WM_RBUTTONDOWN: return MOUSEEVENTF_RIGHTDOWN;
+    case WM_RBUTTONUP: return MOUSEEVENTF_RIGHTUP;
+    case WM_RBUTTONDBLCLK: return MOUSEEVENTF_RIGHTDOWN;
+    case WM_MBUTTONDOWN: return MOUSEEVENTF_MIDDLEDOWN;
+    case WM_MBUTTONUP: return MOUSEEVENTF_MIDDLEUP;
+    case WM_MBUTTONDBLCLK: return MOUSEEVENTF_MIDDLEDOWN;
+    case WM_MOUSEWHEEL: return MOUSEEVENTF_WHEEL;
+    default: return 0;
+    }
+}
+
+static BOOL InjectMouseInput(UINT msg, WPARAM wParam, LPARAM lParam, POINT screenPoint)
+{
+    SetLastError(0);
+    BOOL moved = SetCursorPos(screenPoint.x, screenPoint.y);
+    DWORD flags = MouseFlagsForMessage(msg);
+    if (msg == WM_MOUSEMOVE)
+        return moved;
+    if (!flags)
+        return FALSE;
+
+    INPUT inputEvent = { 0 };
+    inputEvent.type = INPUT_MOUSE;
+    inputEvent.mi.dwFlags = flags;
+    if (msg == WM_MOUSEWHEEL)
+        inputEvent.mi.mouseData = GET_WHEEL_DELTA_WPARAM(wParam);
+
+    UINT sent = SendInput(1, &inputEvent, sizeof(inputEvent));
+    if (sent == 1 && (msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK))
+    {
+        INPUT upEvent = inputEvent;
+        if (msg == WM_LBUTTONDBLCLK)
+            upEvent.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        else if (msg == WM_RBUTTONDBLCLK)
+            upEvent.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+        else
+            upEvent.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+        SendInput(1, &upEvent, sizeof(upEvent));
+    }
+    return sent == 1;
+}
+
+static BOOL InjectVirtualKey(UINT msg, WPARAM vk)
+{
+    if (vk == 0 || vk >= 256)
+        return FALSE;
+
+    INPUT inputEvent = { 0 };
+    inputEvent.type = INPUT_KEYBOARD;
+    inputEvent.ki.wVk = (WORD)vk;
+    if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+        inputEvent.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SetLastError(0);
+    return SendInput(1, &inputEvent, sizeof(inputEvent)) == 1;
+}
+
+static BOOL InjectUnicodeChar(WPARAM ch)
+{
+    if (ch == 0 || ch > 0xFFFF)
+        return FALSE;
+
+    INPUT inputEvents[2] = { 0 };
+    inputEvents[0].type = INPUT_KEYBOARD;
+    inputEvents[0].ki.wScan = (WORD)ch;
+    inputEvents[0].ki.dwFlags = KEYEVENTF_UNICODE;
+    inputEvents[1] = inputEvents[0];
+    inputEvents[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+    SetLastError(0);
+    return SendInput(2, inputEvents, sizeof(INPUT)) == 2;
+}
+
 static void FreePixelBuffers()
 {
     Funcs::pFree(g_pixels);
@@ -952,11 +1132,10 @@ static DWORD WINAPI InputThread(LPVOID param)
 
     POINT      lastPoint;
     BOOL       lmouseDown = FALSE;
-    HWND       hResMoveWindow = NULL;
-    LRESULT    resMoveType = NULL;
 
     lastPoint.x = 0;
     lastPoint.y = 0;
+    BOOL keyDown[256] = { 0 };
 
     for (;;)
     {
@@ -970,7 +1149,6 @@ static DWORD WINAPI InputThread(LPVOID param)
 
         HWND  hWnd{};
         POINT point;
-        POINT lastPointCopy;
         BOOL  mouseMsg = FALSE;
 
         switch (msg)
@@ -1083,7 +1261,6 @@ static DWORD WINAPI InputThread(LPVOID param)
             mouseMsg = TRUE;
             point.x = GET_X_LPARAM(lParam);
             point.y = GET_Y_LPARAM(lParam);
-            lastPointCopy = lastPoint;
             lastPoint = point;
 
             hWnd = Funcs::pWindowFromPoint(point);
@@ -1136,30 +1313,9 @@ static DWORD WINAPI InputThread(LPVOID param)
             else if (msg == WM_LBUTTONDOWN)
             {
                 lmouseDown = TRUE;
-                hResMoveWindow = NULL;
                 g_lastInputHwnd = hWnd;
 
-                HWND topFocusHwnd = GetTopLevelWindow(hWnd);
-                BOOL bringResult = topFocusHwnd ? BringWindowToTop(topFocusHwnd) : FALSE;
-                BOOL foregroundResult = topFocusHwnd ? SetForegroundWindow(topFocusHwnd) : FALSE;
-                HWND activeResult = topFocusHwnd ? SetActiveWindow(topFocusHwnd) : NULL;
-                HWND focusResult = SetFocus(hWnd);
-                if (ShouldLogInput(msg))
-                {
-                    char className[128];
-                    char title[128];
-                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
-                    printf("[input] focus WM_LBUTTONDOWN target=0x%p top=0x%p class='%s' title='%s' bring=%d foreground=%d active=0x%p focus=0x%p lastError=%lu\n",
-                        hWnd,
-                        topFocusHwnd,
-                        className,
-                        title,
-                        bringResult,
-                        foregroundResult,
-                        activeResult,
-                        focusResult,
-                        GetLastError());
-                }
+                TryActivateInputTarget(hWnd, msg);
 
                 RECT startButtonRect;
                 HWND hStartButton = Funcs::pFindWindowA("Button", NULL);
@@ -1185,99 +1341,6 @@ static DWORD WINAPI InputThread(LPVOID param)
                         continue;
                     }
                 }
-            }
-            else if (msg == WM_MOUSEMOVE)
-            {
-                if (!lmouseDown)
-                    continue;
-
-                if (!hResMoveWindow)
-                {
-                    resMoveType = Funcs::pSendMessageA(hWnd, WM_NCHITTEST, NULL, lParam);
-                    while ((Funcs::pGetWindowLongA(hWnd, GWL_STYLE) & WS_CHILD))
-                    {
-                        HWND p = Funcs::pGetParent(hWnd);
-                        if (!p) break;
-                        hWnd = p;
-                    }
-                }
-                else
-                    hWnd = hResMoveWindow;
-
-                int moveX = lastPointCopy.x - point.x;
-                int moveY = lastPointCopy.y - point.y;
-
-                RECT rect;
-                Funcs::pGetWindowRect(hWnd, &rect);
-
-                int x = rect.left;
-                int y = rect.top;
-                int width = rect.right - rect.left;
-                int height = rect.bottom - rect.top;
-                switch (resMoveType)
-                {
-                case HTCAPTION:
-                {
-                    x -= moveX;
-                    y -= moveY;
-                    break;
-                }
-                case HTTOP:
-                {
-                    y -= moveY;
-                    height += moveY;
-                    break;
-                }
-                case HTBOTTOM:
-                {
-                    height -= moveY;
-                    break;
-                }
-                case HTLEFT:
-                {
-                    x -= moveX;
-                    width += moveX;
-                    break;
-                }
-                case HTRIGHT:
-                {
-                    width -= moveX;
-                    break;
-                }
-                case HTTOPLEFT:
-                {
-                    y -= moveY;
-                    height += moveY;
-                    x -= moveX;
-                    width += moveX;
-                    break;
-                }
-                case HTTOPRIGHT:
-                {
-                    y -= moveY;
-                    height += moveY;
-                    width -= moveX;
-                    break;
-                }
-                case HTBOTTOMLEFT:
-                {
-                    height -= moveY;
-                    x -= moveX;
-                    width += moveX;
-                    break;
-                }
-                case HTBOTTOMRIGHT:
-                {
-                    height -= moveY;
-                    width -= moveX;
-                    break;
-                }
-                default:
-                    continue;
-                }
-                Funcs::pMoveWindow(hWnd, x, y, width, height, FALSE);
-                hResMoveWindow = hWnd;
-                continue;
             }
             break;
         }
@@ -1323,31 +1386,54 @@ static DWORD WINAPI InputThread(LPVOID param)
             g_lastInputHwnd = hWnd;
 
             if (msg == WM_LBUTTONDOWN)
-            {
-                HWND finalFocusResult = SetFocus(hWnd);
-                if (ShouldLogInput(msg))
-                {
-                    char className[128];
-                    char title[128];
-                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
-                    printf("[input] final-focus WM_LBUTTONDOWN hwnd=0x%p class='%s' title='%s' focus=0x%p lastError=%lu\n",
-                        hWnd,
-                        className,
-                        title,
-                        finalFocusResult,
-                        GetLastError());
-                }
-            }
+                TryActivateInputTarget(hWnd, msg);
         }
         else
         {
             clientPt = screenPoint;
         }
 
-        SetLastError(0);
-        BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
+        BOOL injected = FALSE;
+        BOOL fallbackToPost = TRUE;
+
+        if (mouseMsg)
+        {
+            injected = InjectMouseInput(msg, wParam, lParam, screenPoint);
+            fallbackToPost = !injected;
+        }
+        else if (msg == WM_CHAR || msg == WM_SYSCHAR)
+        {
+            if (!HasModifierDown(keyDown))
+            {
+                injected = InjectUnicodeChar(wParam);
+                fallbackToPost = !injected;
+            }
+            else
+                fallbackToPost = FALSE;
+        }
+        else if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
+        {
+            BOOL sendPhysical = IsPhysicalKeyVk(wParam) || HasModifierDown(keyDown);
+            UpdateKeyStateCache(msg, wParam, keyDown);
+            if (sendPhysical)
+            {
+                injected = InjectVirtualKey(msg, wParam);
+                fallbackToPost = !injected;
+            }
+            else
+                fallbackToPost = FALSE;
+        }
+
         if (ShouldLogInput(msg))
-            LogInputTarget("post", msg, hWnd, screenPoint, clientPt, posted);
+            LogInputTarget("sendinput", msg, hWnd, screenPoint, clientPt, injected);
+
+        if (fallbackToPost)
+        {
+            SetLastError(0);
+            BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
+            if (ShouldLogInput(msg))
+                LogInputTarget("post-fallback", msg, hWnd, screenPoint, clientPt, posted);
+        }
     }
 exit:
     printf("[!] Input thread exiting\n");
