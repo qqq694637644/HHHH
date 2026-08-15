@@ -13,13 +13,31 @@ if(MSVC)
   add_compile_options(/W3)
 endif()
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(SCREEN2_ZLIB_LIB "${CMAKE_CURRENT_SOURCE_DIR}/参考/ScreenPlugin2/zlib/lib/x64/libz-static.lib")
+else()
+  set(SCREEN2_ZLIB_LIB "${CMAKE_CURRENT_SOURCE_DIR}/参考/ScreenPlugin2/zlib/lib/x86/libz-static.lib")
+endif()
+
+add_library(ScreenTransfer STATIC
+  common/ScreenTransfer/ScreenCodec.cpp
+)
+target_include_directories(ScreenTransfer PUBLIC
+  common/ScreenTransfer
+  "参考/ScreenPlugin2/zlib/include"
+)
+target_link_libraries(ScreenTransfer PUBLIC gdiplus "${SCREEN2_ZLIB_LIB}")
+if(MSVC)
+  target_compile_options(ScreenTransfer PRIVATE /EHsc)
+endif()
+
 add_executable(Server WIN32
   Server/Main.cpp
   Server/Server.cpp
   Server/ControlWindow.cpp
 )
 target_compile_definitions(Server PRIVATE UNICODE _UNICODE)
-target_link_libraries(Server PRIVATE ws2_32)
+target_link_libraries(Server PRIVATE ws2_32 ScreenTransfer)
 if(MSVC)
   # <iostream> uses exceptions (C4530)
   target_compile_options(Server PRIVATE
@@ -37,7 +55,7 @@ add_executable(Client
   common/Panel.cpp
   common/Utils.cpp
 )
-target_link_libraries(Client PRIVATE gdiplus)
+target_link_libraries(Client PRIVATE gdiplus ScreenTransfer)
 if(MSVC)
   target_compile_options(Client PRIVATE
     $<$<CONFIG:Release>:/O1 /Ob0 /Oi>
