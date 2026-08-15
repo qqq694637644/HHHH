@@ -79,7 +79,7 @@ add_executable(Client
   common/Panel.cpp
   common/Utils.cpp
 )
-target_link_libraries(Client PRIVATE gdiplus ScreenTransfer)
+target_link_libraries(Client PRIVATE gdiplus advapi32 ScreenTransfer)
 if(MSVC)
   target_compile_options(Client PRIVATE
     $<$<CONFIG:Release>:/O1 /Ob0 /Oi>
