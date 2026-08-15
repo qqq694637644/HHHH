@@ -1099,6 +1099,225 @@ static BOOL SendScreenPacket(SOCKET s, const std::vector<BYTE>& packet)
     return SendInt(s, packetSize) && SendAll(s, packet.data(), packetSize);
 }
 
+enum ScreenAckStatus
+{
+    screenAckOk,
+    screenAckNeedKeyframe,
+    screenAckTimeout,
+    screenAckClosed
+};
+
+static ScreenAckStatus RecvScreenFrameAck(SOCKET s, int *response)
+{
+    char *data = (char *)response;
+    int received = 0;
+    int size = (int)sizeof(*response);
+    while (received != size)
+    {
+        int ret = Funcs::pRecv(s, data + received, size - received, 0);
+        if (ret <= 0)
+        {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT)
+                return screenAckTimeout;
+            return screenAckClosed;
+        }
+        received += ret;
+    }
+    return *response == 0 ? screenAckOk : screenAckNeedKeyframe;
+}
+
+struct Screen2SendStats
+{
+    unsigned long long firstFrames;
+    unsigned long long nextFrames;
+    unsigned long long totalBytes;
+    unsigned long long originalBytes;
+    unsigned long long compressedBytes;
+    unsigned long long sendMs;
+    unsigned long long ackMs;
+    unsigned long long ackCount;
+    unsigned long long ackTimeouts;
+    unsigned long long sendFailures;
+    unsigned long long budgetWarnings;
+    unsigned long long saturatedDiffs;
+    unsigned long long keyframeRequests;
+    unsigned long long fpsThrottles;
+    unsigned long long qualityDrops;
+    unsigned int maxPacketBytes;
+    unsigned int maxSendMs;
+    unsigned int maxAckMs;
+    int maxRectCount;
+};
+
+static void ResetScreen2Stats(Screen2SendStats *stats)
+{
+    Funcs::pMemset(stats, 0, sizeof(*stats));
+}
+
+static void RecordScreen2SendStats(Screen2SendStats *stats, const screen2::EncodedFrameInfo& info, BOOL sent, DWORD sendMs)
+{
+    if (info.isKeyframe)
+        ++stats->firstFrames;
+    else
+        ++stats->nextFrames;
+    stats->totalBytes += (unsigned long long)info.totalBytes;
+    stats->originalBytes += info.originalSize;
+    stats->compressedBytes += info.compressedSize;
+    stats->sendMs += sendMs;
+    if (sendMs > stats->maxSendMs)
+        stats->maxSendMs = sendMs;
+    if (info.totalBytes > stats->maxPacketBytes)
+        stats->maxPacketBytes = (unsigned int)((info.totalBytes > MAXDWORD) ? MAXDWORD : info.totalBytes);
+    if (info.rectCount > stats->maxRectCount)
+        stats->maxRectCount = info.rectCount;
+    if (!sent)
+        ++stats->sendFailures;
+    if (info.totalBytes >= screen2::MAX_FRAME_PACKET_SIZE)
+        ++stats->budgetWarnings;
+    if (info.saturated)
+        ++stats->saturatedDiffs;
+}
+
+static void RecordScreen2AckStats(Screen2SendStats *stats, DWORD ackMs)
+{
+    ++stats->ackCount;
+    stats->ackMs += ackMs;
+    if (ackMs > stats->maxAckMs)
+        stats->maxAckMs = ackMs;
+}
+
+static DWORD GetEffectiveScreen2FrameMs(DWORD baseFrameMs, DWORD adaptiveFrameMs, ULONGLONG adaptiveUntil)
+{
+    ULONGLONG now = GetTickCount64();
+    if (adaptiveUntil && now < adaptiveUntil && adaptiveFrameMs > baseFrameMs)
+        return adaptiveFrameMs;
+    return baseFrameMs;
+}
+
+static void MaybeReportAndApplyScreen2Stats(Screen2SendStats *stats,
+    ULONGLONG *lastReportTick,
+    screen2::ScreenFrameEncoder *encoder,
+    DWORD *adaptiveFrameMs,
+    ULONGLONG *adaptiveUntil,
+    BOOL *ackAdaptiveThrottleActive,
+    BOOL *ackAdaptiveQualityActive,
+    int *normalAckWindows)
+{
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG intervalMs = now > *lastReportTick ? now - *lastReportTick : 1;
+    if (intervalMs < 3000 && stats->ackTimeouts == 0 && stats->saturatedDiffs == 0 && stats->sendFailures == 0)
+        return;
+
+    const unsigned long long frames = stats->firstFrames + stats->nextFrames;
+    const unsigned long long avgSendMs = frames ? stats->sendMs / frames : 0;
+    const unsigned long long avgAckMs = stats->ackCount ? stats->ackMs / stats->ackCount : 0;
+    const unsigned long long bps = intervalMs ? (stats->totalBytes * 1000ULL) / intervalMs : 0;
+
+    BOOL ackSlow = FALSE;
+    BOOL ackAdaptive = FALSE;
+    BOOL ackQualityDrop = FALSE;
+    BOOL adaptiveRestore = FALSE;
+    int oldQuality = encoder->GetQuality();
+    int newQuality = oldQuality;
+
+    const BOOL hasAckSignal = stats->ackCount > 0 || stats->ackTimeouts > 0;
+    const BOOL singleVerySlowAck = stats->ackCount == 1 && stats->maxAckMs > 3000;
+    const BOOL slowByAck = stats->ackTimeouts > 0 || singleVerySlowAck ||
+        (stats->ackCount >= 2 && (avgAckMs > 1000 || stats->maxAckMs > 2000));
+    const BOOL verySlowByAck = stats->ackTimeouts > 0 || singleVerySlowAck ||
+        (stats->ackCount >= 2 && (avgAckMs > 1500 || stats->maxAckMs > 3000));
+    const BOOL largePacketSlow = stats->ackCount > 0 && slowByAck && stats->maxPacketBytes > 400 * 1024;
+    const BOOL normalAck = stats->ackCount > 0 && stats->ackTimeouts == 0 && avgAckMs <= 700 && stats->maxAckMs <= 1200;
+
+    ackSlow = slowByAck;
+    if (slowByAck)
+    {
+        DWORD targetFrameMs = verySlowByAck ? 2000 : 1500;
+        if (*adaptiveFrameMs < targetFrameMs)
+            *adaptiveFrameMs = targetFrameMs;
+        *adaptiveUntil = now + 9000;
+        *ackAdaptiveThrottleActive = TRUE;
+        *normalAckWindows = 0;
+        ackAdaptive = TRUE;
+        ++stats->fpsThrottles;
+    }
+    else if (normalAck)
+    {
+        ++(*normalAckWindows);
+    }
+    else if (hasAckSignal)
+    {
+        *normalAckWindows = 0;
+    }
+
+    if (largePacketSlow && encoder->GetQuality() > 70)
+    {
+        newQuality = 70;
+        encoder->SetQuality(newQuality);
+        *ackAdaptiveQualityActive = TRUE;
+        ackQualityDrop = TRUE;
+        ++stats->qualityDrops;
+    }
+
+    if (*normalAckWindows >= 3)
+    {
+        BOOL restored = FALSE;
+        if (*ackAdaptiveThrottleActive)
+        {
+            *adaptiveFrameMs = 0;
+            *adaptiveUntil = 0;
+            *ackAdaptiveThrottleActive = FALSE;
+            restored = TRUE;
+        }
+        if (*ackAdaptiveQualityActive && encoder->GetQuality() != screen2::DEFAULT_JPEG_QUALITY)
+        {
+            encoder->SetQuality(screen2::DEFAULT_JPEG_QUALITY);
+            *ackAdaptiveQualityActive = FALSE;
+            restored = TRUE;
+        }
+        if (restored)
+        {
+            adaptiveRestore = TRUE;
+            *normalAckWindows = 0;
+        }
+    }
+
+    printf("[SCREEN2_STATS][client] first=%llu next=%llu bytes=%llu bps=%llu raw=%llu comp=%llu avgSendMs=%llu maxSendMs=%u ackCount=%llu avgAckMs=%llu maxAckMs=%u ackTimeouts=%llu sendFail=%llu budgetWarn=%llu satDiff=%llu kfReq=%llu fpsThrottle=%llu qualityDrop=%llu ackSlow=%u ackAdaptive=%u ackQDrop=%u adaptiveRestore=%u adaptiveMs=%lu quality=%d oldQuality=%d normalAckWin=%d maxPacket=%u maxRects=%d packetBudget=%lu\n",
+        stats->firstFrames,
+        stats->nextFrames,
+        stats->totalBytes,
+        bps,
+        stats->originalBytes,
+        stats->compressedBytes,
+        avgSendMs,
+        stats->maxSendMs,
+        stats->ackCount,
+        avgAckMs,
+        stats->maxAckMs,
+        stats->ackTimeouts,
+        stats->sendFailures,
+        stats->budgetWarnings,
+        stats->saturatedDiffs,
+        stats->keyframeRequests,
+        stats->fpsThrottles,
+        stats->qualityDrops,
+        ackSlow ? 1U : 0U,
+        ackAdaptive ? 1U : 0U,
+        ackQualityDrop ? 1U : 0U,
+        adaptiveRestore ? 1U : 0U,
+        *adaptiveFrameMs,
+        encoder->GetQuality(),
+        oldQuality,
+        *normalAckWindows,
+        stats->maxPacketBytes,
+        stats->maxRectCount,
+        (DWORD)screen2::MAX_FRAME_PACKET_SIZE);
+
+    ResetScreen2Stats(stats);
+    *lastReportTick = now;
+}
+
 static DWORD WINAPI DesktopThread(LPVOID param)
 {
     DWORD sessionId = (DWORD)(ULONG_PTR)param;
@@ -1109,6 +1328,17 @@ static DWORD WINAPI DesktopThread(LPVOID param)
     BOOL sizeSent = FALSE;
     BOOL firstFrameLogged = FALSE;
     BOOL captureFailureLogged = FALSE;
+    Screen2SendStats sendStats;
+    ResetScreen2Stats(&sendStats);
+    ULONGLONG lastStatsReportTick = GetTickCount64();
+    ULONGLONG adaptiveUntil = 0;
+    ULONGLONG lastSaturatedKeyframeAt = 0;
+    DWORD adaptiveFrameMs = 0;
+    DWORD baseFrameMs = 1000 / screen2::DEFAULT_FPS;
+    int saturatedDiffStreak = 0;
+    int normalAckWindows = 0;
+    BOOL ackAdaptiveThrottleActive = FALSE;
+    BOOL ackAdaptiveQualityActive = FALSE;
 
     if (!s)
     {
@@ -1130,9 +1360,14 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         goto exit;
 
     printf("[+] Desktop channel handshake sent (session %lu)\n", sessionId);
+    {
+        DWORD ackTimeoutMs = 5000;
+        Funcs::pSetsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ackTimeoutMs, sizeof(ackTimeoutMs));
+    }
 
     for (;;)
     {
+        ULONGLONG frameStartTick = GetTickCount64();
         if (!CaptureDesktopFrame(rawFrame))
         {
             if (!captureFailureLogged)
@@ -1160,35 +1395,103 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         }
 
         std::vector<BYTE> framePacket;
-        if (!encoder.BuildFrame(rawFrame, framePacket))
+        screen2::EncodedFrameInfo frameInfo;
+        if (!encoder.BuildFrame(rawFrame, framePacket, &frameInfo))
         {
-            Funcs::pSleep(1000 / screen2::DEFAULT_FPS);
+            DWORD frameMs = GetEffectiveScreen2FrameMs(baseFrameMs, adaptiveFrameMs, adaptiveUntil);
+            Funcs::pSleep(frameMs);
             continue;
         }
 
+        if (frameInfo.saturated)
+        {
+            ++saturatedDiffStreak;
+            ++sendStats.saturatedDiffs;
+            ULONGLONG now = GetTickCount64();
+            if (saturatedDiffStreak >= 2)
+            {
+                adaptiveFrameMs = 1000;
+                adaptiveUntil = now + 8000;
+                ++sendStats.fpsThrottles;
+                printf("[SCREEN2][WARN] saturated diff throttling capture interval to %lu ms\n", adaptiveFrameMs);
+            }
+            if (lastSaturatedKeyframeAt && now < lastSaturatedKeyframeAt + 2000)
+            {
+                DWORD waitMs = (DWORD)((lastSaturatedKeyframeAt + 2000) - now);
+                ++sendStats.keyframeRequests;
+                printf("[SCREEN2][WARN] saturated diff keyframe cooldown waited %lu ms\n", waitMs);
+                Funcs::pSleep(waitMs);
+            }
+            lastSaturatedKeyframeAt = GetTickCount64();
+        }
+        else if (!frameInfo.isKeyframe)
+        {
+            saturatedDiffStreak = 0;
+        }
+
+        ULONGLONG sendStartTick = GetTickCount64();
         if (!SendScreenPacket(s, framePacket))
+        {
+            RecordScreen2SendStats(&sendStats, frameInfo, FALSE, 0);
             goto exit;
+        }
+        DWORD sendMs = (DWORD)(GetTickCount64() - sendStartTick);
+        RecordScreen2SendStats(&sendStats, frameInfo, TRUE, sendMs);
 
         int response = 0;
-        if (!RecvInt(s, &response))
+        ULONGLONG ackStartTick = GetTickCount64();
+        ScreenAckStatus ackStatus = RecvScreenFrameAck(s, &response);
+        if (ackStatus == screenAckClosed)
             goto exit;
-        if (response != 0)
+        if (ackStatus == screenAckTimeout)
+        {
+            ++sendStats.ackTimeouts;
+            ++sendStats.keyframeRequests;
             encoder.ForceKeyframe();
+            adaptiveFrameMs = 2000;
+            adaptiveUntil = GetTickCount64() + 9000;
+            ackAdaptiveThrottleActive = TRUE;
+            normalAckWindows = 0;
+            printf("[SCREEN2][WARN] frame ACK timeout, forcing keyframe and throttling capture interval to %lu ms\n", adaptiveFrameMs);
+        }
+        else if (ackStatus == screenAckNeedKeyframe)
+        {
+            ++sendStats.keyframeRequests;
+            encoder.ForceKeyframe();
+            printf("[SCREEN2][WARN] server requested keyframe, forcing full frame\n");
+        }
         else
+        {
+            DWORD ackMs = (DWORD)(GetTickCount64() - ackStartTick);
+            RecordScreen2AckStats(&sendStats, ackMs);
             encoder.CommitLastBuiltFrame();
+        }
+
+        MaybeReportAndApplyScreen2Stats(&sendStats,
+            &lastStatsReportTick,
+            &encoder,
+            &adaptiveFrameMs,
+            &adaptiveUntil,
+            &ackAdaptiveThrottleActive,
+            &ackAdaptiveQualityActive,
+            &normalAckWindows);
 
         if (!firstFrameLogged)
         {
-            printf("[+] First SCREEN2 desktop frame sent: remote=%dx%d, frame=%dx%d, packet=%zu bytes\n",
+            printf("[+] First SCREEN2 desktop frame sent: remote=%dx%d, frame=%dx%d, packet=%zu bytes quality=%d\n",
                 rawFrame.screenWidth,
                 rawFrame.screenHeight,
                 rawFrame.width,
                 rawFrame.height,
-                framePacket.size());
+                framePacket.size(),
+                encoder.GetQuality());
             firstFrameLogged = TRUE;
         }
 
-        Funcs::pSleep(1000 / screen2::DEFAULT_FPS);
+        DWORD frameMs = GetEffectiveScreen2FrameMs(baseFrameMs, adaptiveFrameMs, adaptiveUntil);
+        DWORD elapsedMs = (DWORD)(GetTickCount64() - frameStartTick);
+        if (frameMs > elapsedMs)
+            Funcs::pSleep(frameMs - elapsedMs);
     }
 
 exit:

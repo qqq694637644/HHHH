@@ -8,14 +8,36 @@
 
 namespace
 {
+    const DWORD INITIAL_DIFF_BUFFER_SIZE = 1024 * 1024;
+    const DWORD MAX_DIFF_BUFFER_SIZE = 128 * 1024 * 1024;
+
     bool MarkEquals(const WCHAR* mark, const WCHAR* expected)
     {
         return ::wcsncmp(mark, expected, SCREEN2_SETTING_MARK_SIZE) == 0;
     }
 
+    void ResetEncodedFrameInfo(screen2::EncodedFrameInfo* info, int quality)
+    {
+        if(!info)
+            return;
+        *info = screen2::EncodedFrameInfo();
+        info->quality = quality;
+    }
+
     bool AppendBytes(std::vector<BYTE>& dst, const void* data, size_t size)
     {
         const BYTE* bytes = static_cast<const BYTE*>(data);
+        if(dst.size() > MAX_DIFF_BUFFER_SIZE || size > MAX_DIFF_BUFFER_SIZE - dst.size())
+            return false;
+        if(dst.capacity() < dst.size() + size)
+        {
+            size_t newCapacity = dst.capacity() == 0 ? INITIAL_DIFF_BUFFER_SIZE : dst.capacity();
+            while(newCapacity < dst.size() + size && newCapacity < MAX_DIFF_BUFFER_SIZE)
+                newCapacity *= 2;
+            if(newCapacity < dst.size() + size || newCapacity > MAX_DIFF_BUFFER_SIZE)
+                return false;
+            dst.reserve(newCapacity);
+        }
         dst.insert(dst.end(), bytes, bytes + size);
         return true;
     }
@@ -218,14 +240,25 @@ namespace screen2
         m_quality = std::max(1, std::min(100, quality));
     }
 
+    int ScreenFrameEncoder::GetQuality() const
+    {
+        return m_quality;
+    }
+
     bool ScreenFrameEncoder::BuildFrame(const RawFrame& raw, std::vector<BYTE>& packet)
     {
+        return BuildFrame(raw, packet, nullptr);
+    }
+
+    bool ScreenFrameEncoder::BuildFrame(const RawFrame& raw, std::vector<BYTE>& packet, EncodedFrameInfo* info)
+    {
         packet.clear();
+        ResetEncodedFrameInfo(info, m_quality);
         if(raw.width <= 0 || raw.height <= 0 || raw.stride < raw.width * 3 || raw.pixels.empty())
             return false;
         if(m_forceKeyframe || !m_hasBaseline || raw.width != m_width || raw.height != m_height || raw.stride != m_stride)
-            return BuildFullFrame(raw, packet);
-        return BuildDiffFrame(raw, packet);
+            return BuildFullFrame(raw, packet, info);
+        return BuildDiffFrame(raw, packet, info);
     }
 
     void ScreenFrameEncoder::CommitLastBuiltFrame()
@@ -242,8 +275,9 @@ namespace screen2
         m_forceKeyframe = false;
     }
 
-    bool ScreenFrameEncoder::BuildFullFrame(const RawFrame& raw, std::vector<BYTE>& packet)
+    bool ScreenFrameEncoder::BuildFullFrame(const RawFrame& raw, std::vector<BYTE>& packet, EncodedFrameInfo* info)
     {
+        ResetEncodedFrameInfo(info, m_quality);
         std::vector<BYTE> jpeg;
         std::vector<BYTE> compressed;
         if(!EncodeJpegBgr(raw.pixels.data(), raw.width, raw.height, raw.stride, m_quality, jpeg) ||
@@ -252,6 +286,8 @@ namespace screen2
         while(compressed.size() > MAX_COMPRESSED_FIRST_SIZE && m_quality > MIN_ADAPTIVE_JPEG_QUALITY)
         {
             m_quality = std::max(MIN_ADAPTIVE_JPEG_QUALITY, m_quality - ADAPTIVE_JPEG_QUALITY_STEP);
+            if(info)
+                info->quality = m_quality;
             jpeg.clear();
             compressed.clear();
             if(!EncodeJpegBgr(raw.pixels.data(), raw.width, raw.height, raw.stride, m_quality, jpeg) ||
@@ -266,14 +302,31 @@ namespace screen2
         m_stride = raw.stride;
         m_pendingBaseline = raw.pixels;
         m_pendingSequence = seq;
+        if(info)
+        {
+            info->hasFrame = true;
+            info->isKeyframe = true;
+            info->originalSize = static_cast<DWORD>(jpeg.size());
+            info->compressedSize = static_cast<DWORD>(compressed.size());
+            info->totalBytes = packet.size();
+            info->rectCount = 0;
+            info->quality = m_quality;
+            info->sequence = seq;
+            info->baseSequence = 0;
+        }
         return true;
     }
 
-    bool ScreenFrameEncoder::BuildDiffFrame(const RawFrame& raw, std::vector<BYTE>& packet)
+    bool ScreenFrameEncoder::BuildDiffFrame(const RawFrame& raw, std::vector<BYTE>& packet, EncodedFrameInfo* info)
     {
+        ResetEncodedFrameInfo(info, m_quality);
         std::vector<RECT> rects;
         if(!ScanChangedRects(raw, rects))
-            return BuildFullFrame(raw, packet);
+        {
+            if(info)
+                info->saturated = true;
+            return BuildFullFrame(raw, packet, info);
+        }
         if(rects.empty())
             return false;
 
@@ -297,19 +350,44 @@ namespace screen2
             rd.jpegSize = static_cast<int>(jpeg.size());
             rd.rect = r;
             AppendBytes(payload, &rd, sizeof(rd));
-            AppendBytes(payload, jpeg.data(), jpeg.size());
+            if(!AppendBytes(payload, jpeg.data(), jpeg.size()))
+            {
+                if(info)
+                    info->saturated = true;
+                return BuildFullFrame(raw, packet, info);
+            }
             if(payload.size() > MAX_DIFF_FRAME_SIZE)
-                return BuildFullFrame(raw, packet);
+            {
+                if(info)
+                    info->saturated = true;
+                return BuildFullFrame(raw, packet, info);
+            }
         }
 
         std::vector<BYTE> compressed;
         if(!CompressZlib(payload.data(), static_cast<DWORD>(payload.size()), compressed) || compressed.size() > MAX_COMPRESSED_DIFF_SIZE)
-            return BuildFullFrame(raw, packet);
+        {
+            if(info)
+                info->saturated = true;
+            return BuildFullFrame(raw, packet, info);
+        }
         const unsigned long long seq = m_nextSequence;
         if(!BuildPacket(SCREEN2_FRAME_TYPE_DIFF, seq, m_lastCommittedSequence, compressed.data(), static_cast<DWORD>(payload.size()), static_cast<DWORD>(compressed.size()), static_cast<int>(rects.size()), packet))
             return false;
         m_pendingBaseline = raw.pixels;
         m_pendingSequence = seq;
+        if(info)
+        {
+            info->hasFrame = true;
+            info->isKeyframe = false;
+            info->originalSize = static_cast<DWORD>(payload.size());
+            info->compressedSize = static_cast<DWORD>(compressed.size());
+            info->totalBytes = packet.size();
+            info->rectCount = static_cast<int>(rects.size());
+            info->quality = m_quality;
+            info->sequence = seq;
+            info->baseSequence = m_lastCommittedSequence;
+        }
         return true;
     }
 
@@ -345,6 +423,10 @@ namespace screen2
             return false;
         int tilesX = (raw.width + DIRTY_TILE_WIDTH - 1) / DIRTY_TILE_WIDTH;
         int tilesY = (raw.height + DIRTY_TILE_HEIGHT - 1) / DIRTY_TILE_HEIGHT;
+        if(tilesX <= 0 || tilesY <= 0)
+            return false;
+
+        std::vector<BYTE> dirtyTiles(static_cast<size_t>(tilesX) * tilesY, 0);
         for(int ty = 0; ty < tilesY; ++ty)
         {
             for(int tx = 0; tx < tilesX; ++tx)
@@ -355,11 +437,57 @@ namespace screen2
                 int bottom = std::min(top + DIRTY_TILE_HEIGHT, raw.height);
                 if(IsTileChanged(raw, m_baseline, left, top, right, bottom))
                 {
-                    RECT r = { left, top, right, bottom };
-                    rects.push_back(r);
-                    if(rects.size() > MAX_FRAME_RECTS)
-                        return false;
+                    dirtyTiles[static_cast<size_t>(ty) * tilesX + tx] = 1;
                 }
+            }
+        }
+
+        for(int ty = 0; ty < tilesY; ++ty)
+        {
+            for(int tx = 0; tx < tilesX; ++tx)
+            {
+                BYTE* currentTile = dirtyTiles.data() + static_cast<size_t>(ty) * tilesX + tx;
+                if(*currentTile == 0)
+                    continue;
+
+                const int runStartX = tx;
+                int runEndX = tx + 1;
+                while(runEndX < tilesX && dirtyTiles[static_cast<size_t>(ty) * tilesX + runEndX] != 0)
+                    ++runEndX;
+
+                int runEndY = ty + 1;
+                while(runEndY < tilesY)
+                {
+                    bool fullRowDirty = true;
+                    for(int x = runStartX; x < runEndX; ++x)
+                    {
+                        if(dirtyTiles[static_cast<size_t>(runEndY) * tilesX + x] == 0)
+                        {
+                            fullRowDirty = false;
+                            break;
+                        }
+                    }
+                    if(!fullRowDirty)
+                        break;
+                    ++runEndY;
+                }
+
+                for(int y = ty; y < runEndY; ++y)
+                {
+                    for(int x = runStartX; x < runEndX; ++x)
+                        dirtyTiles[static_cast<size_t>(y) * tilesX + x] = 0;
+                }
+
+                RECT r = {};
+                r.left = runStartX * DIRTY_TILE_WIDTH;
+                r.top = ty * DIRTY_TILE_HEIGHT;
+                r.right = std::min(runEndX * DIRTY_TILE_WIDTH, raw.width);
+                r.bottom = std::min(runEndY * DIRTY_TILE_HEIGHT, raw.height);
+                rects.push_back(r);
+                if(rects.size() > MAX_FRAME_RECTS)
+                    return false;
+
+                tx = runEndX - 1;
             }
         }
         return true;

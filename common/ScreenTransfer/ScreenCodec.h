@@ -37,6 +37,27 @@ namespace screen2
         }
     };
 
+    struct EncodedFrameInfo
+    {
+        bool hasFrame;
+        bool isKeyframe;
+        bool saturated;
+        DWORD originalSize;
+        DWORD compressedSize;
+        size_t totalBytes;
+        int rectCount;
+        int quality;
+        unsigned long long sequence;
+        unsigned long long baseSequence;
+
+        EncodedFrameInfo()
+            : hasFrame(false), isKeyframe(false), saturated(false), originalSize(0),
+              compressedSize(0), totalBytes(0), rectCount(0), quality(DEFAULT_JPEG_QUALITY),
+              sequence(0), baseSequence(0)
+        {
+        }
+    };
+
     int CalcStride24(int width);
 
     bool BuildScreenSizePacket(const RawFrame& frame, std::vector<BYTE>& packet);
@@ -56,12 +77,14 @@ namespace screen2
         void Reset();
         void ForceKeyframe();
         void SetQuality(int quality);
+        int GetQuality() const;
         bool BuildFrame(const RawFrame& raw, std::vector<BYTE>& packet);
+        bool BuildFrame(const RawFrame& raw, std::vector<BYTE>& packet, EncodedFrameInfo* info);
         void CommitLastBuiltFrame();
 
     private:
-        bool BuildFullFrame(const RawFrame& raw, std::vector<BYTE>& packet);
-        bool BuildDiffFrame(const RawFrame& raw, std::vector<BYTE>& packet);
+        bool BuildFullFrame(const RawFrame& raw, std::vector<BYTE>& packet, EncodedFrameInfo* info);
+        bool BuildDiffFrame(const RawFrame& raw, std::vector<BYTE>& packet, EncodedFrameInfo* info);
         bool BuildPacket(unsigned int frameType,
                          unsigned long long sequence,
                          unsigned long long baseSequence,
