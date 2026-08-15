@@ -618,6 +618,12 @@ static DWORD WINAPI DesktopThread(LPVOID param)
 {
     DWORD sessionId = (DWORD)(ULONG_PTR)param;
     SOCKET s = ConnectServer();
+    screen2::ScreenFrameEncoder encoder(screen2::DEFAULT_JPEG_QUALITY);
+    screen2::RawFrame rawFrame;
+    screen2::RawFrame lastSizeFrame;
+    BOOL sizeSent = FALSE;
+    BOOL firstFrameLogged = FALSE;
+    BOOL captureFailureLogged = FALSE;
 
     if (!s)
     {
@@ -640,12 +646,6 @@ static DWORD WINAPI DesktopThread(LPVOID param)
 
     printf("[+] Desktop channel handshake sent (session %lu)\n", sessionId);
 
-    screen2::ScreenFrameEncoder encoder(screen2::DEFAULT_JPEG_QUALITY);
-    screen2::RawFrame rawFrame;
-    screen2::RawFrame lastSizeFrame;
-    BOOL sizeSent = FALSE;
-    BOOL firstFrameLogged = FALSE;
-    BOOL captureFailureLogged = FALSE;
     for (;;)
     {
         if (!CaptureDesktopFrame(rawFrame))

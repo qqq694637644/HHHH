@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15...3.30)
-project(HHHH LANGUAGES CXX)
+project(HHHH LANGUAGES C CXX)
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -13,11 +13,24 @@ if(MSVC)
   add_compile_options(/W3)
 endif()
 
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-  set(SCREEN2_ZLIB_LIB "${CMAKE_CURRENT_SOURCE_DIR}/参考/ScreenPlugin2/zlib/lib/x64/libz-static.lib")
-else()
-  set(SCREEN2_ZLIB_LIB "${CMAKE_CURRENT_SOURCE_DIR}/参考/ScreenPlugin2/zlib/lib/x86/libz-static.lib")
-endif()
+add_library(Screen2Zlib STATIC
+  "参考/ScreenPlugin2/zlib/include/adler32.c"
+  "参考/ScreenPlugin2/zlib/include/compress.c"
+  "参考/ScreenPlugin2/zlib/include/crc32.c"
+  "参考/ScreenPlugin2/zlib/include/deflate.c"
+  "参考/ScreenPlugin2/zlib/include/gzclose.c"
+  "参考/ScreenPlugin2/zlib/include/gzlib.c"
+  "参考/ScreenPlugin2/zlib/include/gzread.c"
+  "参考/ScreenPlugin2/zlib/include/gzwrite.c"
+  "参考/ScreenPlugin2/zlib/include/infback.c"
+  "参考/ScreenPlugin2/zlib/include/inffast.c"
+  "参考/ScreenPlugin2/zlib/include/inflate.c"
+  "参考/ScreenPlugin2/zlib/include/inftrees.c"
+  "参考/ScreenPlugin2/zlib/include/trees.c"
+  "参考/ScreenPlugin2/zlib/include/uncompr.c"
+  "参考/ScreenPlugin2/zlib/include/zutil.c"
+)
+target_include_directories(Screen2Zlib PUBLIC "参考/ScreenPlugin2/zlib/include")
 
 add_library(ScreenTransfer STATIC
   common/ScreenTransfer/ScreenCodec.cpp
@@ -26,7 +39,7 @@ target_include_directories(ScreenTransfer PUBLIC
   common/ScreenTransfer
   "参考/ScreenPlugin2/zlib/include"
 )
-target_link_libraries(ScreenTransfer PUBLIC gdiplus "${SCREEN2_ZLIB_LIB}")
+target_link_libraries(ScreenTransfer PUBLIC gdiplus Screen2Zlib)
 if(MSVC)
   target_compile_options(ScreenTransfer PRIVATE /EHsc)
 endif()
