@@ -1,0 +1,51 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="Plugin\PluginBase.cpp" />
+    <ClCompile Include="Plugin\TestPlugin.cpp" />
+    <ClCompile Include="ScreenPlugin\ScreenCapture.cpp" />
+    <ClCompile Include="ScreenPlugin\ScreenManager.cpp" />
+    <ClCompile Include="zlib\include\adler32.c" />
+    <ClCompile Include="zlib\include\compress.c" />
+    <ClCompile Include="zlib\include\crc32.c" />
+    <ClCompile Include="zlib\include\deflate.c" />
+    <ClCompile Include="zlib\include\gzclose.c" />
+    <ClCompile Include="zlib\include\gzlib.c" />
+    <ClCompile Include="zlib\include\gzread.c" />
+    <ClCompile Include="zlib\include\gzwrite.c" />
+    <ClCompile Include="zlib\include\infback.c" />
+    <ClCompile Include="zlib\include\inffast.c" />
+    <ClCompile Include="zlib\include\inflate.c" />
+    <ClCompile Include="zlib\include\inftrees.c" />
+    <ClCompile Include="zlib\include\trees.c" />
+    <ClCompile Include="zlib\include\uncompr.c" />
+    <ClCompile Include="zlib\include\zutil.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="HPSocket\HPSocket.h" />
+    <ClInclude Include="HPSocket\HPTypeDef.h" />
+    <ClInclude Include="HPSocket\SocketInterface.h" />
+    <ClInclude Include="Plugin\IPlugin.h" />
+    <ClInclude Include="Plugin\PluginBase.h" />
+    <ClInclude Include="Plugin\TestPlugin.h" />
+    <ClInclude Include="ScreenPlugin\ScreenManager.h" />
+    <ClInclude Include="ScreenPlugin\ScreenCapture.h" />
+    <ClInclude Include="ScreenPlugin\ScreenProtocol.h" />
+    <ClInclude Include="Xor\Xor.h" />
+    <ClInclude Include="zlib\include\crc32.h" />
+    <ClInclude Include="zlib\include\deflate.h" />
+    <ClInclude Include="zlib\include\gzguts.h" />
+    <ClInclude Include="zlib\include\inffast.h" />
+    <ClInclude Include="zlib\include\inffixed.h" />
+    <ClInclude Include="zlib\include\inflate.h" />
+    <ClInclude Include="zlib\include\inftrees.h" />
+    <ClInclude Include="zlib\include\trees.h" />
+    <ClInclude Include="zlib\include\zconf.h" />
+    <ClInclude Include="zlib\include\zlib.h" />
+    <ClInclude Include="zlib\include\zutil.h" />
+    <ClInclude Include="zlib\ZlibManager.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
+</Project>
