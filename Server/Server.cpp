@@ -196,6 +196,39 @@ static BOOL SendInputMessage(SOCKET s, UINT msg, WPARAM wParam, LPARAM lParam)
    return SendAll(s, &input, (int) sizeof(input));
 }
 
+static const TCHAR *InputMsgName(UINT msg)
+{
+   switch(msg)
+   {
+      case WM_LBUTTONDOWN: return TEXT("WM_LBUTTONDOWN");
+      case WM_LBUTTONUP: return TEXT("WM_LBUTTONUP");
+      case WM_RBUTTONDOWN: return TEXT("WM_RBUTTONDOWN");
+      case WM_RBUTTONUP: return TEXT("WM_RBUTTONUP");
+      case WM_MBUTTONDOWN: return TEXT("WM_MBUTTONDOWN");
+      case WM_MBUTTONUP: return TEXT("WM_MBUTTONUP");
+      case WM_MOUSEMOVE: return TEXT("WM_MOUSEMOVE");
+      case WM_MOUSEWHEEL: return TEXT("WM_MOUSEWHEEL");
+      case WM_CHAR: return TEXT("WM_CHAR");
+      case WM_KEYDOWN: return TEXT("WM_KEYDOWN");
+      case WM_KEYUP: return TEXT("WM_KEYUP");
+      case WM_SYSCHAR: return TEXT("WM_SYSCHAR");
+      case WM_SYSKEYDOWN: return TEXT("WM_SYSKEYDOWN");
+      case WM_SYSKEYUP: return TEXT("WM_SYSKEYUP");
+      default: return TEXT("UNKNOWN");
+   }
+}
+
+static BOOL ShouldLogInput(UINT msg)
+{
+   static DWORD moveCount = 0;
+   if(msg == WM_MOUSEMOVE)
+   {
+      ++moveCount;
+      return (moveCount % 60) == 1;
+   }
+   return TRUE;
+}
+
 static void SendClientInput(Client *client, UINT msg, WPARAM wParam, LPARAM lParam)
 {
    SOCKET inputSocket = INVALID_SOCKET;
@@ -212,7 +245,11 @@ static void SendClientInput(Client *client, UINT msg, WPARAM wParam, LPARAM lPar
    if(inputSocket == INVALID_SOCKET)
       return;
 
-   if(!SendInputMessage(inputSocket, msg, wParam, lParam) && hWnd)
+   BOOL sent = SendInputMessage(inputSocket, msg, wParam, lParam);
+   if(ShouldLogInput(msg))
+      wprintf(TEXT("[input] send %s wParam=0x%Ix lParam=0x%Ix result=%s\n"), InputMsgName(msg), wParam, lParam, sent ? TEXT("ok") : TEXT("failed"));
+
+   if(!sent && hWnd)
       PostMessage(hWnd, WM_CLOSE, 0, 0);
 }
 
@@ -364,6 +401,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
          break;
       }
       case WM_CHAR:
+      case WM_SYSCHAR:
       {
          if(!client)
             break;
@@ -374,28 +412,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
       }
       case WM_KEYDOWN:
       case WM_KEYUP:
+      case WM_SYSKEYDOWN:
+      case WM_SYSKEYUP:
       {
          if(!client)
             break;
-
-         switch(wParam)
-         {
-            case VK_UP:
-            case VK_DOWN:
-            case VK_RIGHT:
-            case VK_LEFT:
-            case VK_HOME:
-            case VK_END:
-            case VK_PRIOR:
-            case VK_NEXT:
-            case VK_INSERT:
-            case VK_RETURN:
-            case VK_DELETE:
-            case VK_BACK:
-               break;
-            default:
-               return 0;
-         }
          SendClientInput(client, msg, wParam, 0);
          break;
       }
