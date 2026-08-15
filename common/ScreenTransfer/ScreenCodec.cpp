@@ -345,7 +345,7 @@ namespace screen2
             }
             std::vector<BYTE> jpeg;
             if(!EncodeJpegBgr(rectPixels.data(), rw, rh, rs, m_quality, jpeg) || jpeg.empty())
-                return BuildFullFrame(raw, packet);
+                return BuildFullFrame(raw, packet, info);
             CHANGED_RECT_DATA rd = {};
             rd.jpegSize = static_cast<int>(jpeg.size());
             rd.rect = r;
