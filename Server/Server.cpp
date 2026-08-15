@@ -772,6 +772,7 @@ BOOL StartServer(int port)
    WSADATA     wsa;
    SOCKET      serverSocket;
    sockaddr_in addr;
+   const char *listenAddress = "0.0.0.0";
 
    InitializeCriticalSection(&g_critSec);
    memset(g_clients, 0, sizeof(g_clients));
@@ -801,13 +802,14 @@ BOOL StartServer(int port)
       return FALSE;
    }
 
+   memset(&addr, 0, sizeof(addr));
    addr.sin_family      = AF_INET;
-   addr.sin_addr.s_addr = INADDR_ANY;
+   addr.sin_addr.s_addr = htonl(INADDR_ANY);
    addr.sin_port        = htons(port);
 
    if(bind(serverSocket, (sockaddr *) &addr, sizeof(addr)) == SOCKET_ERROR)
    {
-      wprintf(TEXT("[!] bind() failed on port %d: WSAGetLastError=%d\n"), port, WSAGetLastError());
+      wprintf(TEXT("[!] bind() failed on %hs:%d: WSAGetLastError=%d\n"), listenAddress, port, WSAGetLastError());
       return FALSE;
    }
    if(listen(serverSocket, SOMAXCONN) == SOCKET_ERROR)
@@ -818,7 +820,7 @@ BOOL StartServer(int port)
 
    int addrSize = sizeof(addr);
    getsockname(serverSocket, (sockaddr *) &addr, &addrSize);
-   wprintf(TEXT("[+] Listening on Port: %d\n\n"), ntohs(addr.sin_port));
+   wprintf(TEXT("[+] Listening on %hs:%d\n\n"), listenAddress, ntohs(addr.sin_port));
 
    for(;;)
    {
