@@ -24,3 +24,11 @@ jobs:
         run: cmake -S . -B build -A ${{ matrix.arch }}
       - name: Build
         run: cmake --build build --config ${{ matrix.config }}
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HHHH-${{ matrix.arch }}-${{ matrix.config }}
+          path: |
+            build/${{ matrix.config }}/Client.exe
+            build/${{ matrix.config }}/Server.exe
+          if-no-files-found: error
