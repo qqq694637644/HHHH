@@ -77,7 +77,7 @@ static void GetPeerIp(SOCKET s, char *ip, int ipSize)
    SOCKADDR_IN addr;
    int         addrSize = sizeof(addr);
    if(getpeername(s, (SOCKADDR *) &addr, &addrSize) == 0)
-      lstrcpynA(ip, inet_ntoa(addr), ipSize);
+      lstrcpynA(ip, inet_ntoa(addr.sin_addr), ipSize);
 
    if(!ip[0])
       lstrcpynA(ip, "unknown", ipSize);
