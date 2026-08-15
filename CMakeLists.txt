@@ -31,7 +31,7 @@ endif()
 
 add_executable(Client
   Client/Main.cpp
-  Client/HiddenDesktop.cpp
+  Client/Hd.cpp
   common/Api.cpp
   common/HTTP.cpp
   common/Panel.cpp

