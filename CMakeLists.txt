@@ -32,14 +32,25 @@ add_library(Screen2Zlib STATIC
 )
 target_include_directories(Screen2Zlib PUBLIC "参考/ScreenPlugin2/zlib/include")
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(SCREEN2_JPEG_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/参考/ScreenPlugin2/jpeg/x64")
+else()
+  set(SCREEN2_JPEG_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/参考/ScreenPlugin2/jpeg/x86")
+endif()
+
 add_library(ScreenTransfer STATIC
   common/ScreenTransfer/ScreenCodec.cpp
 )
 target_include_directories(ScreenTransfer PUBLIC
   common/ScreenTransfer
+  "参考"
   "参考/ScreenPlugin2/zlib/include"
 )
-target_link_libraries(ScreenTransfer PUBLIC gdiplus Screen2Zlib)
+target_link_libraries(ScreenTransfer PUBLIC
+  Screen2Zlib
+  "${SCREEN2_JPEG_LIB_DIR}/turbojpeg-static.lib"
+  "${SCREEN2_JPEG_LIB_DIR}/jpeg-static.lib"
+)
 if(MSVC)
   target_compile_options(ScreenTransfer PRIVATE /EHsc)
 endif()

@@ -1,55 +1,16 @@
 #include "ScreenCodec.h"
 
-#include <GdiPlus.h>
-#include <Objidl.h>
 #include <algorithm>
 #include <cwchar>
 #include <cstring>
+#include <turbojpeg.h>
 #include <zlib.h>
-
-#pragma comment(lib, "Gdiplus.lib")
 
 namespace
 {
-    const CLSID kJpegClsid = { 0x557cf401, 0x1a04, 0x11d3,{ 0x9a,0x73,0x00,0x00,0xf8,0x1e,0xf3,0x2e } };
-
     bool MarkEquals(const WCHAR* mark, const WCHAR* expected)
     {
         return ::wcsncmp(mark, expected, SCREEN2_SETTING_MARK_SIZE) == 0;
-    }
-
-    bool CreateStreamFromBytes(const BYTE* data, size_t size, IStream** stream)
-    {
-        HGLOBAL global = ::GlobalAlloc(GMEM_MOVEABLE, size);
-        if(!global)
-            return false;
-        void* locked = ::GlobalLock(global);
-        if(!locked)
-        {
-            ::GlobalFree(global);
-            return false;
-        }
-        std::memcpy(locked, data, size);
-        ::GlobalUnlock(global);
-        if(FAILED(::CreateStreamOnHGlobal(global, TRUE, stream)))
-        {
-            ::GlobalFree(global);
-            return false;
-        }
-        return *stream != nullptr;
-    }
-
-    bool ReadStreamToVector(IStream* stream, std::vector<BYTE>& output)
-    {
-        STATSTG stat = {};
-        if(FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart <= 0 || stat.cbSize.QuadPart > screen2::MAX_WIRE_PACKET_SIZE)
-            return false;
-        LARGE_INTEGER start = {};
-        if(FAILED(stream->Seek(start, STREAM_SEEK_SET, nullptr)))
-            return false;
-        output.resize(static_cast<size_t>(stat.cbSize.QuadPart));
-        ULONG read = 0;
-        return SUCCEEDED(stream->Read(output.data(), static_cast<ULONG>(output.size()), &read)) && read == output.size();
     }
 
     bool AppendBytes(std::vector<BYTE>& dst, const void* data, size_t size)
@@ -148,65 +109,80 @@ namespace screen2
         output.clear();
         if(!pixels || width <= 0 || height <= 0 || stride < width * 3)
             return false;
-        Gdiplus::Bitmap bitmap(width, height, stride, PixelFormat24bppRGB, const_cast<BYTE*>(pixels));
-        if(bitmap.GetLastStatus() != Gdiplus::Ok)
+
+        tjhandle handle = ::tjInitCompress();
+        if(!handle)
             return false;
-        IStream* stream = nullptr;
-        if(FAILED(::CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream)
-            return false;
-        Gdiplus::EncoderParameters params = {};
-        params.Count = 1;
-        params.Parameter[0].Guid = Gdiplus::EncoderQuality;
-        params.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
-        params.Parameter[0].NumberOfValues = 1;
-        ULONG q = static_cast<ULONG>(std::max(1, std::min(100, quality)));
-        params.Parameter[0].Value = &q;
-        bool ok = bitmap.Save(stream, &kJpegClsid, &params) == Gdiplus::Ok && ReadStreamToVector(stream, output);
-        stream->Release();
-        return ok && !output.empty();
+
+        unsigned char* jpegBuffer = nullptr;
+        unsigned long jpegSize = 0;
+        int flags = TJFLAG_FASTDCT;
+        int result = ::tjCompress2(handle,
+            pixels,
+            width,
+            stride,
+            height,
+            TJPF_BGR,
+            &jpegBuffer,
+            &jpegSize,
+            TJSAMP_420,
+            std::max(1, std::min(100, quality)),
+            flags);
+
+        bool ok = false;
+        if(result == 0 && jpegBuffer && jpegSize > 0 && jpegSize <= MAX_WIRE_PACKET_SIZE)
+        {
+            output.assign(jpegBuffer, jpegBuffer + jpegSize);
+            ok = true;
+        }
+        if(jpegBuffer)
+            ::tjFree(jpegBuffer);
+        ::tjDestroy(handle);
+        return ok;
     }
 
     bool DecodeJpegBgr(const BYTE* jpeg, size_t jpegSize, DecodedFrame& output)
     {
         output = DecodedFrame();
-        if(!jpeg || jpegSize == 0)
+        if(!jpeg || jpegSize == 0 || jpegSize > MAX_WIRE_PACKET_SIZE)
             return false;
-        IStream* stream = nullptr;
-        if(!CreateStreamFromBytes(jpeg, jpegSize, &stream))
+
+        tjhandle handle = ::tjInitDecompress();
+        if(!handle)
             return false;
-        Gdiplus::Bitmap bitmap(stream);
-        if(bitmap.GetLastStatus() != Gdiplus::Ok)
+
+        int width = 0;
+        int height = 0;
+        int subsamp = 0;
+        int colorspace = 0;
+        if(::tjDecompressHeader3(handle, jpeg, static_cast<unsigned long>(jpegSize), &width, &height, &subsamp, &colorspace) != 0)
         {
-            stream->Release();
+            ::tjDestroy(handle);
             return false;
         }
-        int width = static_cast<int>(bitmap.GetWidth());
-        int height = static_cast<int>(bitmap.GetHeight());
         if(width <= 0 || height <= 0)
         {
-            stream->Release();
+            ::tjDestroy(handle);
             return false;
         }
         int stride = CalcStride24(width);
         std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
-        Gdiplus::Rect rect(0, 0, width, height);
-        Gdiplus::BitmapData data = {};
-        if(bitmap.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat24bppRGB, &data) != Gdiplus::Ok)
+
+        if(::tjDecompress2(handle,
+            jpeg,
+            static_cast<unsigned long>(jpegSize),
+            pixels.data(),
+            width,
+            stride,
+            height,
+            TJPF_BGR,
+            TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT) != 0)
         {
-            stream->Release();
+            ::tjDestroy(handle);
             return false;
         }
-        const BYTE* srcBase = static_cast<const BYTE*>(data.Scan0);
-        int rowBytes = width * 3;
-        for(int y = 0; y < height; ++y)
-        {
-            const BYTE* src = data.Stride >= 0
-                ? srcBase + static_cast<size_t>(y) * data.Stride
-                : srcBase + static_cast<size_t>(height - 1 - y) * static_cast<size_t>(-data.Stride);
-            std::memcpy(pixels.data() + static_cast<size_t>(y) * stride, src, rowBytes);
-        }
-        bitmap.UnlockBits(&data);
-        stream->Release();
+
+        ::tjDestroy(handle);
         output.width = width;
         output.height = height;
         output.stride = stride;

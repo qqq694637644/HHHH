@@ -1,21 +1,7 @@
 #include "Server.h"
 #include "../common/ScreenTransfer/ScreenCodec.h"
 
-#include <GdiPlus.h>
 #include <vector>
-
-
-typedef NTSTATUS (NTAPI *T_RtlDecompressBuffer)
-(
-   USHORT CompressionFormat,
-   PUCHAR UncompressedBuffer,
-   ULONG  UncompressedBufferSize,
-   PUCHAR CompressedBuffer,
-   ULONG  CompressedBufferSize,
-   PULONG FinalUncompressedSize
-);
-
-static T_RtlDecompressBuffer pRtlDecompressBuffer;
 
 enum Connection { desktop, input, end };
 
@@ -58,8 +44,6 @@ enum SysMenuIds   { fullScreen = 101, startExplorer = WM_USER + 1, startRun, sta
 static Client           g_clients[gc_maxClients];
 static DWORD            g_nextSessionId = 1;
 static CRITICAL_SECTION g_critSec;
-static ULONG_PTR        g_gdiplusToken = 0;
-static BOOL             g_gdiplusStarted = FALSE;
 
 static const TCHAR *ConnectionName(int connection)
 {
@@ -788,32 +772,9 @@ BOOL StartServer(int port)
    WSADATA     wsa;
    SOCKET      serverSocket;
    sockaddr_in addr;
-   HMODULE     ntdll = LoadLibrary(TEXT("ntdll.dll"));
-
-   if(!ntdll)
-   {
-      wprintf(TEXT("[!] LoadLibrary(ntdll.dll) failed: GetLastError=%lu\n"), GetLastError());
-      return FALSE;
-   }
-
-   pRtlDecompressBuffer = (T_RtlDecompressBuffer) GetProcAddress(ntdll, "RtlDecompressBuffer");
-   if(!pRtlDecompressBuffer)
-   {
-      wprintf(TEXT("[!] GetProcAddress(RtlDecompressBuffer) failed: GetLastError=%lu\n"), GetLastError());
-      return FALSE;
-   }
 
    InitializeCriticalSection(&g_critSec);
    memset(g_clients, 0, sizeof(g_clients));
-
-   Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-   if(Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL) == Gdiplus::Ok)
-   {
-      g_gdiplusStarted = TRUE;
-      wprintf(TEXT("[diag] GDI+ startup: ok\n"));
-   }
-   else
-      wprintf(TEXT("[!] GDI+ startup failed; SCREEN2 JPEG decode may fail\n"));
 
    if(CW_Register(WndProc))
       wprintf(TEXT("[diag] Control window class registered\n"));
