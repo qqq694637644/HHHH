@@ -46,7 +46,6 @@ static char       g_desktopName[MAX_PATH];
 static HWND       g_lastInputHwnd = NULL;
 static DWORD      g_lastDesktopDumpTick = 0;
 static BOOL       g_dumpedInputDesktopState = FALSE;
-static DWORD      g_lastCaptureShellSkipLogTick = 0;
 static DWORD      g_lastCaptureHungSkipLogTick = 0;
 static DWORD      g_lastCaptureSlowPrintLogTick = 0;
 static ULARGE_INTEGER lisize;
@@ -280,21 +279,6 @@ static BOOL IsExcludedInputClass(const char *className)
         !lstrcmpiA(className, "IME") ||
         !lstrcmpiA(className, "MSCTFIME UI") ||
         !lstrcmpiA(className, "SysShadow");
-}
-
-static BOOL IsShellCaptureClass(const char *className)
-{
-    if (!className || !className[0])
-        return FALSE;
-
-    return !lstrcmpiA(className, "UserOOBEWindowClass") ||
-        !lstrcmpiA(className, "Shell_TrayWnd") ||
-        !lstrcmpiA(className, "Progman") ||
-        !lstrcmpiA(className, "WorkerW") ||
-        !lstrcmpiA(className, "SysShadow") ||
-        !lstrcmpiA(className, "tooltips_class32") ||
-        !lstrcmpiA(className, "IME") ||
-        !lstrcmpiA(className, "MSCTFIME UI");
 }
 
 static BOOL ShouldLogCaptureEvent(DWORD *lastTick, DWORD intervalMs)
@@ -835,15 +819,6 @@ static BOOL CALLBACK EnumHwndsPrint(HWND hWnd, LPARAM lParam)
 
     if (!Funcs::pIsWindowVisible(hWnd))
         return TRUE;
-
-    char className[128] = { 0 };
-    GetClassNameA(hWnd, className, sizeof(className));
-    if (IsShellCaptureClass(className))
-    {
-        if (ShouldLogCaptureEvent(&g_lastCaptureShellSkipLogTick, 3000))
-            LogCaptureWindow("skip shell window", hWnd, 0);
-        return TRUE;
-    }
 
     PaintWindow(hWnd, data->hDc, data->hDcScreen);
 
@@ -1881,6 +1856,25 @@ static DWORD WINAPI InputThread(LPVOID param)
         {
         case WmStartApp::startExplorer:
         {
+            const DWORD neverCombine = 2;
+            const char *valueName = Strs::hd4;
+
+            HKEY hKey = NULL;
+            DWORD value = 0;
+            DWORD size = sizeof(DWORD);
+            DWORD type = REG_DWORD;
+            BOOL restoreTaskbarSetting = FALSE;
+
+            if (Funcs::pRegOpenKeyExA(HKEY_CURRENT_USER, Strs::hd3, 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS)
+            {
+                if (Funcs::pRegQueryValueExA(hKey, valueName, 0, &type, (BYTE *)&value, &size) == ERROR_SUCCESS)
+                {
+                    restoreTaskbarSetting = TRUE;
+                    if (value != neverCombine)
+                        Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&neverCombine, size);
+                }
+            }
+
             char explorerPath[MAX_PATH] = { 0 };
             Funcs::pGetWindowsDirectoryA(explorerPath, MAX_PATH);
             Funcs::pLstrcatA(explorerPath, Strs::fileDiv);
@@ -1904,7 +1898,26 @@ static DWORD WINAPI InputThread(LPVOID param)
                 CloseProcessInformationHandles(&processInfo);
             }
 
-            printf("[diag] startExplorer skipped global Explorer taskbar registry/appbar changes\n");
+            APPBARDATA appbarData = { 0 };
+            appbarData.cbSize = sizeof(appbarData);
+            for (int i = 0; i < 5; ++i)
+            {
+                Sleep(1000);
+                appbarData.hWnd = Funcs::pFindWindowA(Strs::shell_TrayWnd, NULL);
+                if (appbarData.hWnd)
+                    break;
+            }
+
+            appbarData.lParam = ABS_ALWAYSONTOP;
+            Funcs::pSHAppBarMessage(ABM_SETSTATE, &appbarData);
+
+            if (hKey)
+            {
+                if (restoreTaskbarSetting)
+                    Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&value, size);
+                Funcs::pRegCloseKey(hKey);
+            }
+
             DumpHiddenDesktopWindows("after-startExplorer");
             break;
         }
