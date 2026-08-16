@@ -742,6 +742,14 @@ struct ClientProxySlot
     POINT lastPoint;
     HWND moveWindow;
     LRESULT moveHit;
+    HDC backDc;
+    HBITMAP backBmp;
+    HGDIOBJ oldBackBmp;
+    BYTE *backBits;
+    int backWidth;
+    int backHeight;
+    int backStride;
+    BOOL frameReady;
 };
 
 static const WCHAR *g_clientProxyClassName = L"HHHHClientProxyX64";
@@ -795,6 +803,120 @@ static ClientProxySlot *FindFreeClientProxySlot()
     return NULL;
 }
 
+static void FreeClientProxyBackBuffer(ClientProxySlot *slot)
+{
+    if (!slot)
+        return;
+    if (slot->backDc && slot->oldBackBmp)
+    {
+        SelectObject(slot->backDc, slot->oldBackBmp);
+        slot->oldBackBmp = NULL;
+    }
+    if (slot->backBmp)
+    {
+        DeleteObject(slot->backBmp);
+        slot->backBmp = NULL;
+    }
+    if (slot->backDc)
+    {
+        DeleteDC(slot->backDc);
+        slot->backDc = NULL;
+    }
+    slot->backBits = NULL;
+    slot->backWidth = 0;
+    slot->backHeight = 0;
+    slot->backStride = 0;
+    slot->frameReady = FALSE;
+}
+
+static BOOL EnsureClientProxyBackBuffer(ClientProxySlot *slot, int width, int height)
+{
+    if (!slot || width <= 0 || height <= 0)
+        return FALSE;
+    if (slot->backDc && slot->backBmp && slot->backBits && slot->backWidth == width && slot->backHeight == height)
+        return TRUE;
+
+    FreeClientProxyBackBuffer(slot);
+
+    BITMAPINFO bmi;
+    Funcs::pMemset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 24;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    slot->backDc = CreateCompatibleDC(NULL);
+    if (!slot->backDc)
+        return FALSE;
+
+    void *bits = NULL;
+    slot->backBmp = CreateDIBSection(slot->backDc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!slot->backBmp || !bits)
+    {
+        FreeClientProxyBackBuffer(slot);
+        return FALSE;
+    }
+
+    slot->oldBackBmp = SelectObject(slot->backDc, slot->backBmp);
+    if (!slot->oldBackBmp)
+    {
+        FreeClientProxyBackBuffer(slot);
+        return FALSE;
+    }
+
+    slot->backBits = (BYTE *)bits;
+    slot->backWidth = width;
+    slot->backHeight = height;
+    slot->backStride = (width * 3 + 3) & ~3;
+    slot->frameReady = FALSE;
+    return TRUE;
+}
+
+static BOOL UpdateClientProxyBackBuffer(ClientProxySlot *slot)
+{
+    if (!slot || !slot->hWnd || !g_clientProxyCritReady)
+        return FALSE;
+
+    BOOL updated = FALSE;
+    EnterCriticalSection(&g_clientProxyCrit);
+    if (!g_clientProxyPixels.empty() && g_clientProxyWidth > 0 && g_clientProxyHeight > 0 && g_clientProxyStride > 0)
+    {
+        int srcX = slot->entry.left;
+        int srcY = slot->entry.top;
+        int srcW = slot->entry.right - slot->entry.left;
+        int srcH = slot->entry.bottom - slot->entry.top;
+        if (srcX < 0) srcX = 0;
+        if (srcY < 0) srcY = 0;
+        if (srcX + srcW > g_clientProxyWidth) srcW = g_clientProxyWidth - srcX;
+        if (srcY + srcH > g_clientProxyHeight) srcH = g_clientProxyHeight - srcY;
+
+        if (srcW > 0 && srcH > 0 && EnsureClientProxyBackBuffer(slot, srcW, srcH))
+        {
+            for (int y = 0; y < srcH; ++y)
+            {
+                const BYTE *srcRow = g_clientProxyPixels.data() + (size_t)(srcY + y) * g_clientProxyStride + (size_t)srcX * 3;
+                BYTE *dstRow = slot->backBits + (size_t)y * slot->backStride;
+                Funcs::pMemcpy(dstRow, srcRow, (size_t)srcW * 3);
+            }
+            slot->frameReady = TRUE;
+            updated = TRUE;
+        }
+    }
+    LeaveCriticalSection(&g_clientProxyCrit);
+    return updated;
+}
+
+static void UpdateClientProxyBackBuffers()
+{
+    for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+    {
+        if (g_clientProxySlots[i].hWnd && UpdateClientProxyBackBuffer(&g_clientProxySlots[i]))
+            InvalidateRect(g_clientProxySlots[i].hWnd, NULL, FALSE);
+    }
+}
+
 static void PositionClientProxyWindow(ClientProxySlot *slot)
 {
     if (!slot || !slot->hWnd)
@@ -823,6 +945,7 @@ static void DestroyClientProxyWindowsLocal()
         if (hWnd)
         {
             g_clientProxySlots[i].hWnd = NULL;
+            FreeClientProxyBackBuffer(&g_clientProxySlots[i]);
             DestroyWindow(hWnd);
         }
         Funcs::pMemset(&g_clientProxySlots[i], 0, sizeof(g_clientProxySlots[i]));
@@ -851,6 +974,7 @@ static void SyncClientMainProxyWindows()
             HWND oldHwnd = g_clientProxySlots[i].hWnd;
             printf("[client-proxy] destroy proxy hwnd=0x%p hidden=0x%llx\n", oldHwnd, g_clientProxySlots[i].hiddenHwnd);
             g_clientProxySlots[i].hWnd = NULL;
+            FreeClientProxyBackBuffer(&g_clientProxySlots[i]);
             DestroyWindow(oldHwnd);
             Funcs::pMemset(&g_clientProxySlots[i], 0, sizeof(g_clientProxySlots[i]));
         }
@@ -895,6 +1019,7 @@ static void SyncClientMainProxyWindows()
             slot->entry = entries[i];
         }
         PositionClientProxyWindow(slot);
+        UpdateClientProxyBackBuffer(slot);
     }
 }
 
@@ -903,7 +1028,7 @@ static void InvalidateClientMainProxyWindows()
     for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
     {
         if (g_clientProxySlots[i].hWnd)
-            InvalidateRgn(g_clientProxySlots[i].hWnd, NULL, FALSE);
+            InvalidateRect(g_clientProxySlots[i].hWnd, NULL, FALSE);
     }
 }
 
@@ -1024,49 +1149,25 @@ static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
         HDC hDc = BeginPaint(hWnd, &ps);
         RECT clientRect;
         GetClientRect(hWnd, &clientRect);
-        HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(hDc, &clientRect, brush);
-        DeleteObject(brush);
-
-        if (slot && g_clientProxyCritReady)
+        if (slot && slot->frameReady && slot->backDc && slot->backWidth > 0 && slot->backHeight > 0)
         {
-            EnterCriticalSection(&g_clientProxyCrit);
-            if (!g_clientProxyPixels.empty() && g_clientProxyWidth > 0 && g_clientProxyHeight > 0 && g_clientProxyStride > 0)
-            {
-                int srcX = slot->entry.left;
-                int srcY = slot->entry.top;
-                int srcW = slot->entry.right - slot->entry.left;
-                int srcH = slot->entry.bottom - slot->entry.top;
-                if (srcX < 0) srcX = 0;
-                if (srcY < 0) srcY = 0;
-                if (srcX + srcW > g_clientProxyWidth) srcW = g_clientProxyWidth - srcX;
-                if (srcY + srcH > g_clientProxyHeight) srcH = g_clientProxyHeight - srcY;
-                if (srcW > 0 && srcH > 0)
-                {
-                    const int cropStride = (srcW * 3 + 3) & ~3;
-                    std::vector<BYTE> crop((size_t)cropStride * srcH);
-                    for (int y = 0; y < srcH; ++y)
-                    {
-                        const BYTE *srcRow = g_clientProxyPixels.data() + (size_t)(srcY + y) * g_clientProxyStride + (size_t)srcX * 3;
-                        BYTE *dstRow = crop.data() + (size_t)y * cropStride;
-                        Funcs::pMemcpy(dstRow, srcRow, (size_t)srcW * 3);
-                    }
-
-                    BITMAPINFO bmi;
-                    Funcs::pMemset(&bmi, 0, sizeof(bmi));
-                    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-                    bmi.bmiHeader.biWidth = srcW;
-                    bmi.bmiHeader.biHeight = -srcH;
-                    bmi.bmiHeader.biPlanes = 1;
-                    bmi.bmiHeader.biBitCount = 24;
-                    bmi.bmiHeader.biCompression = BI_RGB;
-                    StretchDIBits(hDc,
-                        0, 0, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
-                        0, 0, srcW, srcH,
-                        crop.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
-                }
-            }
-            LeaveCriticalSection(&g_clientProxyCrit);
+            StretchBlt(hDc,
+                0,
+                0,
+                clientRect.right - clientRect.left,
+                clientRect.bottom - clientRect.top,
+                slot->backDc,
+                0,
+                0,
+                slot->backWidth,
+                slot->backHeight,
+                SRCCOPY);
+        }
+        else
+        {
+            HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hDc, &clientRect, brush);
+            DeleteObject(brush);
         }
 
         EndPaint(hWnd, &ps);
@@ -1109,6 +1210,12 @@ static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
         DestroyWindow(hWnd);
         return 0;
     case WM_NCDESTROY:
+        if (slot && slot->hWnd == hWnd)
+        {
+            slot->hWnd = NULL;
+            FreeClientProxyBackBuffer(slot);
+            Funcs::pMemset(slot, 0, sizeof(*slot));
+        }
         SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
         return DefWindowProc(hWnd, msg, wParam, lParam);
     default:
@@ -1124,7 +1231,7 @@ static BOOL RegisterClientProxyWindowClass()
     wc.lpfnWndProc = ClientProxyWndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = g_clientProxyClassName;
     if (RegisterClassExW(&wc))
         return TRUE;
@@ -1159,7 +1266,6 @@ static DWORD WINAPI ClientMainProxyThread(LPVOID)
 
     while (!g_clientProxyStop)
     {
-        SyncClientMainProxyWindows();
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
             if (msg.message == WM_QUIT)
@@ -1167,15 +1273,21 @@ static DWORD WINAPI ClientMainProxyThread(LPVOID)
                 g_clientProxyStop = TRUE;
                 break;
             }
+            if (msg.message == WM_APP + 0x251)
+            {
+                SyncClientMainProxyWindows();
+                UpdateClientProxyBackBuffers();
+                continue;
+            }
             if (msg.message == WM_APP + 0x252)
             {
-                InvalidateClientMainProxyWindows();
+                UpdateClientProxyBackBuffers();
                 continue;
             }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-        Funcs::pSleep(33);
+        Funcs::pSleep(5);
     }
 
     DestroyClientProxyWindowsLocal();
