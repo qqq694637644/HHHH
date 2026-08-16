@@ -2053,6 +2053,31 @@ static DWORD WINAPI InputThread(LPVOID param)
         if (!RecvAll(s, &input, (int)sizeof(input)))
             goto exit;
 
+        WINDOW_PROXY_INPUT proxyInput = { 0 };
+        BOOL hasProxyInput = FALSE;
+        if (input.msg == winproxy::INPUT_MESSAGE_MARK)
+        {
+            if (input.wParam != sizeof(WINDOW_PROXY_INPUT) || input.lParam != winproxy::PROTOCOL_VERSION)
+            {
+                printf("[winproxy-input] invalid prefix size=%lu version=%lu\n", input.wParam, input.lParam);
+                goto exit;
+            }
+            if (!RecvAll(s, &proxyInput, (int)sizeof(proxyInput)))
+                goto exit;
+            if (proxyInput.version != winproxy::PROTOCOL_VERSION || proxyInput.size != sizeof(proxyInput) || !proxyInput.hwnd)
+            {
+                printf("[winproxy-input] invalid payload version=%lu size=%lu hwnd=0x%llx\n",
+                    proxyInput.version,
+                    proxyInput.size,
+                    proxyInput.hwnd);
+                continue;
+            }
+            hasProxyInput = TRUE;
+            input.msg = proxyInput.msg;
+            input.wParam = (DWORD)proxyInput.wParam;
+            input.lParam = (DWORD)proxyInput.lParam;
+        }
+
         UINT   msg = (UINT)input.msg;
         WPARAM wParam = (WPARAM)input.wParam;
         LPARAM lParam = (LPARAM)input.lParam;
@@ -2182,25 +2207,43 @@ static DWORD WINAPI InputThread(LPVOID param)
         case WM_SYSKEYDOWN:
         case WM_SYSKEYUP:
         {
-            point = lastPoint;
-            hWnd = GetFocus();
-            if (!hWnd)
-                hWnd = GetForegroundWindow();
-            if (!hWnd)
-                hWnd = g_lastInputHwnd;
-            if (!hWnd)
-                hWnd = FindHiddenDesktopWindowFromPoint(point);
+            if (hasProxyInput)
+            {
+                point.x = proxyInput.screenX;
+                point.y = proxyInput.screenY;
+                hWnd = (HWND)(ULONG_PTR)proxyInput.hwnd;
+                g_lastInputHwnd = hWnd;
+            }
+            else
+            {
+                point = lastPoint;
+                hWnd = GetFocus();
+                if (!hWnd)
+                    hWnd = GetForegroundWindow();
+                if (!hWnd)
+                    hWnd = g_lastInputHwnd;
+                if (!hWnd)
+                    hWnd = FindHiddenDesktopWindowFromPoint(point);
+            }
             break;
         }
         default:
         {
             mouseMsg = TRUE;
-            point.x = GET_X_LPARAM(lParam);
-            point.y = GET_Y_LPARAM(lParam);
+            if (hasProxyInput)
+            {
+                point.x = proxyInput.screenX;
+                point.y = proxyInput.screenY;
+            }
+            else
+            {
+                point.x = GET_X_LPARAM(lParam);
+                point.y = GET_Y_LPARAM(lParam);
+            }
             lastPointCopy = lastPoint;
             lastPoint = point;
 
-            hWnd = FindHiddenDesktopWindowFromPoint(point);
+            hWnd = hasProxyInput ? (HWND)(ULONG_PTR)proxyInput.hwnd : FindHiddenDesktopWindowFromPoint(point);
             if (!hWnd)
             {
                 POINT emptyPoint = { 0, 0 };
@@ -2209,7 +2252,7 @@ static DWORD WINAPI InputThread(LPVOID param)
                 continue;
             }
             if (ShouldLogInput(msg))
-                LogWindowDetails("hidden-hit-test", hWnd);
+                LogWindowDetails(hasProxyInput ? "proxy-target" : "hidden-hit-test", hWnd);
 
             if (msg == WM_LBUTTONUP)
             {

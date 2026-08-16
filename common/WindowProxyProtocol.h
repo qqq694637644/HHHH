@@ -35,12 +35,28 @@ struct WINDOW_PROXY_ENTRY
     WCHAR title[128];
     WCHAR imageName[260];
 };
+
+struct WINDOW_PROXY_INPUT
+{
+    DWORD version;
+    DWORD size;
+    DWORD msg;
+    DWORD flags;
+    unsigned long long hwnd;
+    unsigned long long wParam;
+    long long lParam;
+    LONG screenX;
+    LONG screenY;
+};
 #pragma pack(pop)
 
 namespace winproxy
 {
     const DWORD PROTOCOL_VERSION = 1;
+    const DWORD INPUT_MESSAGE_MARK = 0x4E495057; // 'WPIN'
     const DWORD FLAG_X64_ONLY = 1;
+    const DWORD INPUT_FLAG_MOUSE = 1;
+    const DWORD INPUT_FLAG_KEYBOARD = 2;
     const DWORD STATE_VISIBLE = 1;
     const DWORD STATE_ENABLED = 2;
     const DWORD STATE_MINIMIZED = 4;
