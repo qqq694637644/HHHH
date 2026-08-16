@@ -750,6 +750,7 @@ struct ClientProxySlot
     int backHeight;
     int backStride;
     BOOL frameReady;
+    BOOL applyingRemotePosition;
 };
 
 static const WCHAR *g_clientProxyClassName = L"HHHHClientProxyX64";
@@ -927,14 +928,18 @@ static void PositionClientProxyWindow(ClientProxySlot *slot)
         return;
 
     SetWindowTextW(slot->hWnd, slot->entry.title[0] ? slot->entry.title : slot->entry.className);
+    slot->applyingRemotePosition = TRUE;
     SetWindowPos(slot->hWnd,
-        HWND_TOP,
+        NULL,
         slot->entry.left,
         slot->entry.top,
         width,
         height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRgn(slot->hWnd, NULL, FALSE);
+        SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    slot->applyingRemotePosition = FALSE;
+    if (!IsWindowVisible(slot->hWnd))
+        ShowWindow(slot->hWnd, SW_SHOWNOACTIVATE);
+    InvalidateRect(slot->hWnd, NULL, FALSE);
 }
 
 static void DestroyClientProxyWindowsLocal()
@@ -996,7 +1001,7 @@ static void SyncClientMainProxyWindows()
             slot->hWnd = CreateWindowExW(WS_EX_APPWINDOW,
                 g_clientProxyClassName,
                 entries[i].title[0] ? entries[i].title : entries[i].className,
-                WS_POPUP | WS_VISIBLE,
+                WS_POPUP,
                 entries[i].left,
                 entries[i].top,
                 width > 0 ? width : 100,
@@ -1032,17 +1037,54 @@ static void InvalidateClientMainProxyWindows()
     }
 }
 
-static void ApplyClientProxyMove(ClientProxySlot *slot, UINT msg, POINT remotePoint)
+static BOOL ApplyClientProxyMove(ClientProxySlot *slot, UINT msg, POINT remotePoint)
 {
     if (!slot)
-        return;
+        return FALSE;
+
+    HWND hiddenHwnd = (HWND)(ULONG_PTR)slot->hiddenHwnd;
+    HWND topHwnd = GetMovableTopWindow(hiddenHwnd);
+    LPARAM remoteLParam = MAKELPARAM(remotePoint.x, remotePoint.y);
+
+    if (msg == WM_LBUTTONUP && topHwnd)
+    {
+        LRESULT hit = SendMessageA(topHwnd, WM_NCHITTEST, 0, remoteLParam);
+        switch (hit)
+        {
+        case HTCLOSE:
+            SetLastError(0);
+            PostMessageA(topHwnd, WM_CLOSE, 0, 0);
+            printf("[client-proxy-op] close hidden=0x%p proxy=0x%p lastError=%lu\n", topHwnd, slot->hWnd, GetLastError());
+            slot->lmouseDown = FALSE;
+            slot->moveWindow = NULL;
+            slot->moveHit = 0;
+            return TRUE;
+        case HTMINBUTTON:
+            ShowWindow(topHwnd, SW_MINIMIZE);
+            ShowWindow(slot->hWnd, SW_MINIMIZE);
+            printf("[client-proxy-op] minimize hidden=0x%p proxy=0x%p\n", topHwnd, slot->hWnd);
+            slot->lmouseDown = FALSE;
+            slot->moveWindow = NULL;
+            slot->moveHit = 0;
+            return TRUE;
+        case HTMAXBUTTON:
+            ShowWindow(topHwnd, IsZoomed(topHwnd) ? SW_RESTORE : SW_MAXIMIZE);
+            printf("[client-proxy-op] max-restore hidden=0x%p proxy=0x%p zoomed=%d\n", topHwnd, slot->hWnd, IsZoomed(topHwnd));
+            slot->lmouseDown = FALSE;
+            slot->moveWindow = NULL;
+            slot->moveHit = 0;
+            return TRUE;
+        default:
+            break;
+        }
+    }
 
     if (msg == WM_LBUTTONDOWN)
     {
         slot->lmouseDown = TRUE;
         slot->lastPoint = remotePoint;
-        slot->moveWindow = GetMovableTopWindow((HWND)(ULONG_PTR)slot->hiddenHwnd);
-        slot->moveHit = slot->moveWindow ? SendMessageA(slot->moveWindow, WM_NCHITTEST, 0, MAKELPARAM(remotePoint.x, remotePoint.y)) : 0;
+        slot->moveWindow = topHwnd;
+        slot->moveHit = slot->moveWindow ? SendMessageA(slot->moveWindow, WM_NCHITTEST, 0, remoteLParam) : 0;
         printf("[client-proxy-input] nchittest hidden=0x%llx moveWindow=0x%p hit=%lld movable=%d\n",
             slot->hiddenHwnd, slot->moveWindow, (long long)slot->moveHit, IsMoveResizeHit(slot->moveHit));
     }
@@ -1060,7 +1102,7 @@ static void ApplyClientProxyMove(ClientProxySlot *slot, UINT msg, POINT remotePo
 
         RECT rect;
         if (!GetWindowRect(slot->moveWindow, &rect))
-            return;
+            return FALSE;
 
         int x = rect.left;
         int y = rect.top;
@@ -1082,10 +1124,20 @@ static void ApplyClientProxyMove(ClientProxySlot *slot, UINT msg, POINT remotePo
         if (height < 50) height = 50;
         SetLastError(0);
         BOOL moved = MoveWindow(slot->moveWindow, x, y, width, height, TRUE);
+        if (moved)
+        {
+            slot->entry.left = x;
+            slot->entry.top = y;
+            slot->entry.right = x + width;
+            slot->entry.bottom = y + height;
+            PositionClientProxyWindow(slot);
+            UpdateClientProxyBackBuffer(slot);
+        }
         if (ShouldLogInput(msg))
             printf("[client-proxy-input] move hidden=0x%llx hwnd=0x%p result=%s lastError=%lu\n",
                 slot->hiddenHwnd, slot->moveWindow, moved ? "ok" : "failed", GetLastError());
     }
+    return FALSE;
 }
 
 static void PostClientProxyInput(ClientProxySlot *slot, HWND proxyHwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1121,13 +1173,94 @@ static void PostClientProxyInput(ClientProxySlot *slot, HWND proxyHwnd, UINT msg
 
     HWND hiddenHwnd = (HWND)(ULONG_PTR)slot->hiddenHwnd;
     LPARAM remoteLParam = MAKELPARAM(remotePoint.x, remotePoint.y);
-    ApplyClientProxyMove(slot, msg, remotePoint);
+    if (ApplyClientProxyMove(slot, msg, remotePoint))
+        return;
 
     SetLastError(0);
     BOOL posted = PostMessageA(hiddenHwnd, msg, wParam, (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ? remoteLParam : lParam);
     if (ShouldLogInput(msg))
         printf("[client-proxy-input] post %s proxy=0x%p hidden=0x%p remote=(%ld,%ld) result=%s lastError=%lu\n",
             InputMsgName(msg), proxyHwnd, hiddenHwnd, remotePoint.x, remotePoint.y, posted ? "ok" : "failed", GetLastError());
+}
+
+static void ApplyClientProxyLocalRect(ClientProxySlot *slot, HWND proxyHwnd)
+{
+    if (!slot || !slot->hiddenHwnd || slot->applyingRemotePosition || !proxyHwnd)
+        return;
+
+    if (IsIconic(proxyHwnd))
+        return;
+
+    RECT rect;
+    if (!GetWindowRect(proxyHwnd, &rect))
+        return;
+
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    if (width < 50 || height < 50)
+        return;
+
+    HWND hiddenTop = GetMovableTopWindow((HWND)(ULONG_PTR)slot->hiddenHwnd);
+    if (!hiddenTop)
+        return;
+
+    SetLastError(0);
+    BOOL moved = MoveWindow(hiddenTop, rect.left, rect.top, width, height, TRUE);
+    if (moved)
+    {
+        slot->entry.left = rect.left;
+        slot->entry.top = rect.top;
+        slot->entry.right = rect.right;
+        slot->entry.bottom = rect.bottom;
+        UpdateClientProxyBackBuffer(slot);
+    }
+    printf("[client-proxy-op] local-rect proxy=0x%p hidden=0x%p rect=(%ld,%ld,%ld,%ld) result=%s lastError=%lu\n",
+        proxyHwnd,
+        hiddenTop,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        moved ? "ok" : "failed",
+        GetLastError());
+}
+
+static BOOL ApplyClientProxySysCommand(ClientProxySlot *slot, HWND proxyHwnd, WPARAM wParam, LPARAM lParam)
+{
+    if (!slot || !slot->hiddenHwnd)
+        return FALSE;
+
+    HWND hiddenTop = GetMovableTopWindow((HWND)(ULONG_PTR)slot->hiddenHwnd);
+    if (!hiddenTop)
+        return FALSE;
+
+    UINT cmd = (UINT)(wParam & 0xFFF0);
+    switch (cmd)
+    {
+    case SC_CLOSE:
+        SetLastError(0);
+        PostMessageA(hiddenTop, WM_CLOSE, 0, 0);
+        printf("[client-proxy-op] sys-close proxy=0x%p hidden=0x%p lastError=%lu\n", proxyHwnd, hiddenTop, GetLastError());
+        return TRUE;
+    case SC_MINIMIZE:
+        ShowWindow(hiddenTop, SW_MINIMIZE);
+        printf("[client-proxy-op] sys-minimize proxy=0x%p hidden=0x%p\n", proxyHwnd, hiddenTop);
+        return FALSE;
+    case SC_RESTORE:
+        ShowWindow(hiddenTop, SW_RESTORE);
+        printf("[client-proxy-op] sys-restore proxy=0x%p hidden=0x%p\n", proxyHwnd, hiddenTop);
+        return FALSE;
+    case SC_MAXIMIZE:
+        ShowWindow(hiddenTop, SW_MAXIMIZE);
+        printf("[client-proxy-op] sys-maximize proxy=0x%p hidden=0x%p\n", proxyHwnd, hiddenTop);
+        return FALSE;
+    case SC_MOVE:
+    case SC_SIZE:
+        PostMessageA(hiddenTop, WM_SYSCOMMAND, wParam, lParam);
+        return FALSE;
+    default:
+        return FALSE;
+    }
 }
 
 static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1192,11 +1325,26 @@ static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
     case WM_RBUTTONDBLCLK:
     case WM_MBUTTONDBLCLK:
     case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
         PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
         return 0;
     case WM_MOUSEMOVE:
-        if (wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))
-            PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+    {
+        TRACKMOUSEEVENT tme;
+        Funcs::pMemset(&tme, 0, sizeof(tme));
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hWnd;
+        TrackMouseEvent(&tme);
+        PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (slot && slot->hiddenHwnd)
+            PostMessageA((HWND)(ULONG_PTR)slot->hiddenHwnd, WM_MOUSELEAVE, 0, 0);
         return 0;
     case WM_CHAR:
     case WM_SYSCHAR:
@@ -1206,7 +1354,32 @@ static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
     case WM_SYSKEYUP:
         PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
         return 0;
+    case WM_SYSCOMMAND:
+        if (ApplyClientProxySysCommand(slot, hWnd, wParam, lParam))
+        {
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    case WM_WINDOWPOSCHANGED:
+    {
+        LRESULT result = DefWindowProc(hWnd, msg, wParam, lParam);
+        WINDOWPOS *wp = (WINDOWPOS *)lParam;
+        if (slot && wp && !slot->applyingRemotePosition && (!(wp->flags & SWP_NOMOVE) || !(wp->flags & SWP_NOSIZE)))
+            ApplyClientProxyLocalRect(slot, hWnd);
+        return result;
+    }
+    case WM_EXITSIZEMOVE:
+        ApplyClientProxyLocalRect(slot, hWnd);
+        return 0;
     case WM_CLOSE:
+        if (slot && slot->hiddenHwnd)
+        {
+            HWND hiddenTop = GetMovableTopWindow((HWND)(ULONG_PTR)slot->hiddenHwnd);
+            if (hiddenTop)
+                PostMessageA(hiddenTop, WM_CLOSE, 0, 0);
+            printf("[client-proxy-op] close proxy=0x%p hidden=0x%p\n", hWnd, hiddenTop);
+        }
         DestroyWindow(hWnd);
         return 0;
     case WM_NCDESTROY:
