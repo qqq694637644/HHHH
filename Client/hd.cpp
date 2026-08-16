@@ -920,7 +920,7 @@ static void UpdateClientProxyBackBuffers()
 
 static DWORD GetClientProxyWindowStyle()
 {
-    return WS_OVERLAPPEDWINDOW;
+    return WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
 }
 
 static DWORD GetClientProxyWindowExStyle()
@@ -952,8 +952,6 @@ static BOOL BuildProxyOuterRectFromEntry(const WINDOW_PROXY_ENTRY& entry, RECT *
         return FALSE;
     RECT rect = { entry.left, entry.top, entry.right, entry.bottom };
     if (rect.right <= rect.left || rect.bottom <= rect.top)
-        return FALSE;
-    if (!AdjustWindowRectEx(&rect, GetClientProxyWindowStyle(), FALSE, GetClientProxyWindowExStyle()))
         return FALSE;
     *outerRect = rect;
     return TRUE;
@@ -1189,13 +1187,16 @@ static BOOL ApplyClientProxyMove(ClientProxySlot *slot, UINT msg, POINT remotePo
     return FALSE;
 }
 
+static BOOL IsClientProxyMouseMessage(UINT msg);
+static BOOL IsClientProxyWheelMessage(UINT msg);
+
 static void PostClientProxyInput(ClientProxySlot *slot, HWND proxyHwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (!slot || !slot->hiddenHwnd)
         return;
 
     POINT clientPoint = { 0, 0 };
-    if (msg == WM_MOUSEWHEEL)
+    if (IsClientProxyWheelMessage(msg))
     {
         clientPoint.x = GET_X_LPARAM(lParam);
         clientPoint.y = GET_Y_LPARAM(lParam);
@@ -1221,15 +1222,52 @@ static void PostClientProxyInput(ClientProxySlot *slot, HWND proxyHwnd, UINT msg
     remotePoint.y = slot->entry.top + (LONG)((double)clientPoint.y * remoteHeight / proxyHeight);
 
     HWND hiddenHwnd = (HWND)(ULONG_PTR)slot->hiddenHwnd;
-    LPARAM remoteLParam = MAKELPARAM(remotePoint.x, remotePoint.y);
     if (ApplyClientProxyMove(slot, msg, remotePoint))
         return;
 
+    HWND targetHwnd = hiddenHwnd;
+    LPARAM postLParam = lParam;
+    if (IsClientProxyMouseMessage(msg))
+    {
+        targetHwnd = FindChildInputTarget(hiddenHwnd, remotePoint);
+        if (!targetHwnd)
+            targetHwnd = hiddenHwnd;
+
+        if (IsClientProxyWheelMessage(msg))
+        {
+            postLParam = MAKELPARAM(remotePoint.x, remotePoint.y);
+        }
+        else if (msg == WM_MOUSELEAVE)
+        {
+            postLParam = 0;
+        }
+        else
+        {
+            POINT targetClient = remotePoint;
+            ScreenToClient(targetHwnd, &targetClient);
+            postLParam = MAKELPARAM(targetClient.x, targetClient.y);
+        }
+    }
+
     SetLastError(0);
-    BOOL posted = PostMessageA(hiddenHwnd, msg, wParam, (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ? remoteLParam : lParam);
+    BOOL posted = PostMessageA(targetHwnd, msg, wParam, postLParam);
     if (ShouldLogInput(msg))
-        printf("[client-proxy-input] post %s proxy=0x%p hidden=0x%p remote=(%ld,%ld) result=%s lastError=%lu\n",
-            InputMsgName(msg), proxyHwnd, hiddenHwnd, remotePoint.x, remotePoint.y, posted ? "ok" : "failed", GetLastError());
+    {
+        POINT loggedClient = remotePoint;
+        if (IsClientProxyMouseMessage(msg) && targetHwnd && !IsClientProxyWheelMessage(msg))
+            ScreenToClient(targetHwnd, &loggedClient);
+        printf("[client-proxy-input] post %s proxy=0x%p hidden=0x%p target=0x%p screen=(%ld,%ld) client=(%ld,%ld) result=%s lastError=%lu\n",
+            InputMsgName(msg),
+            proxyHwnd,
+            hiddenHwnd,
+            targetHwnd,
+            remotePoint.x,
+            remotePoint.y,
+            loggedClient.x,
+            loggedClient.y,
+            posted ? "ok" : "failed",
+            GetLastError());
+    }
 }
 
 static void ApplyClientProxyLocalRect(ClientProxySlot *slot, HWND proxyHwnd)
@@ -1312,6 +1350,48 @@ static BOOL ApplyClientProxySysCommand(ClientProxySlot *slot, HWND proxyHwnd, WP
     }
 }
 
+static BOOL IsClientProxyMouseMessage(UINT msg)
+{
+    return msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST;
+}
+
+static BOOL IsClientProxyWheelMessage(UINT msg)
+{
+    return msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL;
+}
+
+static LRESULT HitTestClientProxyWindow(HWND hWnd, LPARAM lParam)
+{
+    RECT rect;
+    if (!GetWindowRect(hWnd, &rect))
+        return HTCLIENT;
+
+    POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    const int resizeBorder = max(6, GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER));
+    BOOL left = pt.x >= rect.left && pt.x < rect.left + resizeBorder;
+    BOOL right = pt.x < rect.right && pt.x >= rect.right - resizeBorder;
+    BOOL top = pt.y >= rect.top && pt.y < rect.top + resizeBorder;
+    BOOL bottom = pt.y < rect.bottom && pt.y >= rect.bottom - resizeBorder;
+
+    if (top && left)
+        return HTTOPLEFT;
+    if (top && right)
+        return HTTOPRIGHT;
+    if (bottom && left)
+        return HTBOTTOMLEFT;
+    if (bottom && right)
+        return HTBOTTOMRIGHT;
+    if (top)
+        return HTTOP;
+    if (bottom)
+        return HTBOTTOM;
+    if (left)
+        return HTLEFT;
+    if (right)
+        return HTRIGHT;
+    return HTCLIENT;
+}
+
 static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     ClientProxySlot *slot = (ClientProxySlot *)GetWindowLongPtr(hWnd, GWLP_USERDATA);
@@ -1325,6 +1405,12 @@ static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
 
     switch (msg)
     {
+    case WM_NCCALCSIZE:
+        if (wParam)
+            return 0;
+        break;
+    case WM_NCHITTEST:
+        return HitTestClientProxyWindow(hWnd, lParam);
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
