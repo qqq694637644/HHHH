@@ -271,7 +271,6 @@ static void UpdateClientWindowProxySnapshot(Client *client, const WINDOW_PROXY_H
    if(client->hWnd)
    {
       InvalidateRgn(client->hWnd, NULL, FALSE);
-      PostMessage(client->hWnd, gc_proxySyncMsg, header->sequence, 0);
    }
 }
 
@@ -1311,14 +1310,6 @@ BOOL StartServer(int port)
          wprintf(TEXT("[!] Control window class registration failed: GetLastError=%lu\n"), err);
          return FALSE;
       }
-   }
-
-   if(RegisterProxyWindowClass())
-      wprintf(TEXT("[diag] Proxy window class registered\n"));
-   else
-   {
-      wprintf(TEXT("[!] Proxy window class registration failed: GetLastError=%lu\n"), GetLastError());
-      return FALSE;
    }
 
    if(WSAStartup(MAKEWORD(2, 2), &wsa) != 0)

