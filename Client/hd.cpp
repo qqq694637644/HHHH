@@ -405,10 +405,94 @@ struct WindowProxyBuildContext
 {
     WINDOW_PROXY_HEADER *header;
     WINDOW_PROXY_ENTRY *entries;
+    const screen2::RawFrame *frame;
     DWORD count;
     DWORD capacity;
     DWORD skipped32BitOrUnknown;
+    DWORD trimmedRects;
 };
+
+static BOOL IsProxyBackgroundPixel(const BYTE *pixel)
+{
+    if (!pixel)
+        return TRUE;
+    return (pixel[0] + pixel[1] + pixel[2]) <= 24;
+}
+
+static BOOL TrimWindowProxyEntryToFrame(WINDOW_PROXY_ENTRY *entry, const screen2::RawFrame *frame)
+{
+    if (!entry || !frame || frame->pixels.empty() || frame->width <= 0 || frame->height <= 0 || frame->stride <= 0)
+        return FALSE;
+
+    int left = (int)entry->left;
+    int top = (int)entry->top;
+    int right = (int)entry->right;
+    int bottom = (int)entry->bottom;
+    if (right <= left || bottom <= top)
+        return FALSE;
+
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > frame->width) right = frame->width;
+    if (bottom > frame->height) bottom = frame->height;
+    if (right <= left || bottom <= top)
+        return FALSE;
+
+    int minX = right;
+    int minY = bottom;
+    int maxX = left - 1;
+    int maxY = top - 1;
+    for (int y = top; y < bottom; ++y)
+    {
+        const BYTE *row = frame->pixels.data() + (size_t)y * frame->stride;
+        for (int x = left; x < right; ++x)
+        {
+            const BYTE *pixel = row + (size_t)x * 3;
+            if (!IsProxyBackgroundPixel(pixel))
+            {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+
+    if (maxX < minX || maxY < minY)
+        return FALSE;
+
+    const int padding = 2;
+    minX = max(left, minX - padding);
+    minY = max(top, minY - padding);
+    maxX = min(right - 1, maxX + padding);
+    maxY = min(bottom - 1, maxY + padding);
+
+    int trimmedWidth = maxX - minX + 1;
+    int trimmedHeight = maxY - minY + 1;
+    int originalWidth = right - left;
+    int originalHeight = bottom - top;
+    if (trimmedWidth < 50 || trimmedHeight < 50)
+        return FALSE;
+    if (trimmedWidth >= originalWidth - 4 && trimmedHeight >= originalHeight - 4)
+        return FALSE;
+
+    printf("[client-proxy] trim source hidden=0x%llx rect=(%ld,%ld,%ld,%ld)->(%d,%d,%d,%d)\n",
+        entry->hwnd,
+        entry->left,
+        entry->top,
+        entry->right,
+        entry->bottom,
+        minX,
+        minY,
+        maxX + 1,
+        maxY + 1);
+
+    entry->left = minX;
+    entry->top = minY;
+    entry->right = maxX + 1;
+    entry->bottom = maxY + 1;
+    return TRUE;
+}
 
 static BOOL CALLBACK BuildWindowProxySnapshotEnumProc(HWND hWnd, LPARAM lParam)
 {
@@ -453,6 +537,8 @@ static BOOL CALLBACK BuildWindowProxySnapshotEnumProc(HWND hWnd, LPARAM lParam)
     entry->top = rect.top;
     entry->right = rect.right;
     entry->bottom = rect.bottom;
+    if (ctx->frame && TrimWindowProxyEntryToFrame(entry, ctx->frame))
+        ++ctx->trimmedRects;
 
     WCHAR className[64] = { 0 };
     WCHAR title[128] = { 0 };
@@ -466,7 +552,7 @@ static BOOL CALLBACK BuildWindowProxySnapshotEnumProc(HWND hWnd, LPARAM lParam)
     return TRUE;
 }
 
-static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *windowCount, DWORD *skippedCount)
+static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *windowCount, DWORD *skippedCount, const screen2::RawFrame *frame)
 {
     packet.clear();
     if (windowCount)
@@ -485,6 +571,7 @@ static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *win
     WindowProxyBuildContext ctx = { 0 };
     ctx.header = header;
     ctx.entries = entries;
+    ctx.frame = frame;
     ctx.capacity = winproxy::MAX_WINDOWS;
 
     SetLastError(0);
@@ -511,10 +598,12 @@ static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *win
         *windowCount = ctx.count;
     if (skippedCount)
         *skippedCount = ctx.skipped32BitOrUnknown;
+    if (ctx.trimmedRects)
+        printf("[client-proxy] trimmed %lu proxy source rects in snapshot seq=%lu\n", ctx.trimmedRects, header->sequence);
     return TRUE;
 }
 #else
-static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *windowCount, DWORD *skippedCount)
+static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *windowCount, DWORD *skippedCount, const screen2::RawFrame *frame)
 {
     packet.clear();
     if (windowCount)
@@ -954,18 +1043,27 @@ static LRESULT CALLBACK ClientProxyWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 if (srcY + srcH > g_clientProxyHeight) srcH = g_clientProxyHeight - srcY;
                 if (srcW > 0 && srcH > 0)
                 {
+                    const int cropStride = (srcW * 3 + 3) & ~3;
+                    std::vector<BYTE> crop((size_t)cropStride * srcH);
+                    for (int y = 0; y < srcH; ++y)
+                    {
+                        const BYTE *srcRow = g_clientProxyPixels.data() + (size_t)(srcY + y) * g_clientProxyStride + (size_t)srcX * 3;
+                        BYTE *dstRow = crop.data() + (size_t)y * cropStride;
+                        Funcs::pMemcpy(dstRow, srcRow, (size_t)srcW * 3);
+                    }
+
                     BITMAPINFO bmi;
                     Funcs::pMemset(&bmi, 0, sizeof(bmi));
                     bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-                    bmi.bmiHeader.biWidth = g_clientProxyWidth;
-                    bmi.bmiHeader.biHeight = -g_clientProxyHeight;
+                    bmi.bmiHeader.biWidth = srcW;
+                    bmi.bmiHeader.biHeight = -srcH;
                     bmi.bmiHeader.biPlanes = 1;
                     bmi.bmiHeader.biBitCount = 24;
                     bmi.bmiHeader.biCompression = BI_RGB;
                     StretchDIBits(hDc,
                         0, 0, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top,
-                        srcX, srcY, srcW, srcH,
-                        g_clientProxyPixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                        0, 0, srcW, srcH,
+                        crop.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
                 }
             }
             LeaveCriticalSection(&g_clientProxyCrit);
@@ -1069,6 +1167,11 @@ static DWORD WINAPI ClientMainProxyThread(LPVOID)
                 g_clientProxyStop = TRUE;
                 break;
             }
+            if (msg.message == WM_APP + 0x252)
+            {
+                InvalidateClientMainProxyWindows();
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -1114,6 +1217,22 @@ static void UpdateClientMainProxySnapshot(const WINDOW_PROXY_HEADER *header, con
 
     if (g_clientProxyThreadId)
         PostThreadMessage(g_clientProxyThreadId, WM_APP + 0x251, header->sequence, 0);
+}
+
+static void UpdateClientMainProxyFrame(const screen2::RawFrame& frame)
+{
+    if (!g_clientProxyCritReady || frame.width <= 0 || frame.height <= 0 || frame.stride <= 0 || frame.pixels.empty())
+        return;
+
+    EnterCriticalSection(&g_clientProxyCrit);
+    g_clientProxyWidth = frame.width;
+    g_clientProxyHeight = frame.height;
+    g_clientProxyStride = frame.stride;
+    g_clientProxyPixels = frame.pixels;
+    LeaveCriticalSection(&g_clientProxyCrit);
+
+    if (g_clientProxyThreadId)
+        PostThreadMessage(g_clientProxyThreadId, WM_APP + 0x252, 0, 0);
 }
 
 static BOOL ShouldLogInput(UINT msg)
@@ -2122,6 +2241,7 @@ static DWORD WINAPI DesktopThread(LPVOID param)
             Funcs::pSleep(100);
             continue;
         }
+        UpdateClientMainProxyFrame(rawFrame);
 
         if (!sizeSent ||
             rawFrame.virtualX != lastSizeFrame.virtualX ||
@@ -2144,7 +2264,7 @@ static DWORD WINAPI DesktopThread(LPVOID param)
             std::vector<BYTE> proxyPacket;
             DWORD proxyWindowCount = 0;
             DWORD skippedProxyCount = 0;
-            if (BuildWindowProxySnapshotPacket(proxyPacket, &proxyWindowCount, &skippedProxyCount))
+            if (BuildWindowProxySnapshotPacket(proxyPacket, &proxyWindowCount, &skippedProxyCount, &rawFrame))
             {
                 const WINDOW_PROXY_HEADER *proxyHeader = (const WINDOW_PROXY_HEADER *)proxyPacket.data();
                 const WINDOW_PROXY_ENTRY *proxyEntries = (const WINDOW_PROXY_ENTRY *)(proxyPacket.data() + sizeof(WINDOW_PROXY_HEADER));
