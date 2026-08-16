@@ -918,6 +918,47 @@ static void UpdateClientProxyBackBuffers()
     }
 }
 
+static DWORD GetClientProxyWindowStyle()
+{
+    return WS_OVERLAPPEDWINDOW;
+}
+
+static DWORD GetClientProxyWindowExStyle()
+{
+    return WS_EX_APPWINDOW;
+}
+
+static BOOL GetProxyClientScreenRect(HWND hWnd, RECT *rect)
+{
+    if (!hWnd || !rect)
+        return FALSE;
+    RECT clientRect = { 0 };
+    if (!GetClientRect(hWnd, &clientRect))
+        return FALSE;
+    POINT topLeft = { clientRect.left, clientRect.top };
+    POINT bottomRight = { clientRect.right, clientRect.bottom };
+    if (!ClientToScreen(hWnd, &topLeft) || !ClientToScreen(hWnd, &bottomRight))
+        return FALSE;
+    rect->left = topLeft.x;
+    rect->top = topLeft.y;
+    rect->right = bottomRight.x;
+    rect->bottom = bottomRight.y;
+    return TRUE;
+}
+
+static BOOL BuildProxyOuterRectFromEntry(const WINDOW_PROXY_ENTRY& entry, RECT *outerRect)
+{
+    if (!outerRect)
+        return FALSE;
+    RECT rect = { entry.left, entry.top, entry.right, entry.bottom };
+    if (rect.right <= rect.left || rect.bottom <= rect.top)
+        return FALSE;
+    if (!AdjustWindowRectEx(&rect, GetClientProxyWindowStyle(), FALSE, GetClientProxyWindowExStyle()))
+        return FALSE;
+    *outerRect = rect;
+    return TRUE;
+}
+
 static void PositionClientProxyWindow(ClientProxySlot *slot)
 {
     if (!slot || !slot->hWnd)
@@ -927,14 +968,18 @@ static void PositionClientProxyWindow(ClientProxySlot *slot)
     if (width <= 0 || height <= 0)
         return;
 
+    RECT outerRect = { 0 };
+    if (!BuildProxyOuterRectFromEntry(slot->entry, &outerRect))
+        return;
+
     SetWindowTextW(slot->hWnd, slot->entry.title[0] ? slot->entry.title : slot->entry.className);
     slot->applyingRemotePosition = TRUE;
     SetWindowPos(slot->hWnd,
         NULL,
-        slot->entry.left,
-        slot->entry.top,
-        width,
-        height,
+        outerRect.left,
+        outerRect.top,
+        outerRect.right - outerRect.left,
+        outerRect.bottom - outerRect.top,
         SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
     slot->applyingRemotePosition = FALSE;
     if (!IsWindowVisible(slot->hWnd))
@@ -996,16 +1041,20 @@ static void SyncClientMainProxyWindows()
             Funcs::pMemset(slot, 0, sizeof(*slot));
             slot->hiddenHwnd = entries[i].hwnd;
             slot->entry = entries[i];
-            LONG width = entries[i].right - entries[i].left;
-            LONG height = entries[i].bottom - entries[i].top;
-            slot->hWnd = CreateWindowExW(WS_EX_APPWINDOW,
+            RECT outerRect = { entries[i].left, entries[i].top, entries[i].right, entries[i].bottom };
+            if (!BuildProxyOuterRectFromEntry(entries[i], &outerRect))
+            {
+                Funcs::pMemset(slot, 0, sizeof(*slot));
+                continue;
+            }
+            slot->hWnd = CreateWindowExW(GetClientProxyWindowExStyle(),
                 g_clientProxyClassName,
                 entries[i].title[0] ? entries[i].title : entries[i].className,
-                WS_POPUP,
-                entries[i].left,
-                entries[i].top,
-                width > 0 ? width : 100,
-                height > 0 ? height : 100,
+                GetClientProxyWindowStyle(),
+                outerRect.left,
+                outerRect.top,
+                outerRect.right > outerRect.left ? outerRect.right - outerRect.left : 100,
+                outerRect.bottom > outerRect.top ? outerRect.bottom - outerRect.top : 100,
                 NULL,
                 NULL,
                 GetModuleHandle(NULL),
@@ -1192,7 +1241,7 @@ static void ApplyClientProxyLocalRect(ClientProxySlot *slot, HWND proxyHwnd)
         return;
 
     RECT rect;
-    if (!GetWindowRect(proxyHwnd, &rect))
+    if (!GetProxyClientScreenRect(proxyHwnd, &rect))
         return;
 
     int width = rect.right - rect.left;
@@ -1214,7 +1263,7 @@ static void ApplyClientProxyLocalRect(ClientProxySlot *slot, HWND proxyHwnd)
         slot->entry.bottom = rect.bottom;
         UpdateClientProxyBackBuffer(slot);
     }
-    printf("[client-proxy-op] local-rect proxy=0x%p hidden=0x%p rect=(%ld,%ld,%ld,%ld) result=%s lastError=%lu\n",
+    printf("[client-proxy-op] local-client-rect proxy=0x%p hidden=0x%p rect=(%ld,%ld,%ld,%ld) result=%s lastError=%lu\n",
         proxyHwnd,
         hiddenTop,
         rect.left,
