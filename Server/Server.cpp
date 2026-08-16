@@ -1,5 +1,6 @@
 #include "Server.h"
 #include "../common/ScreenTransfer/ScreenCodec.h"
+#include "../common/WindowProxyProtocol.h"
 
 #include <vector>
 
@@ -27,6 +28,9 @@ struct Client
    HANDLE minEvent;
    BOOL   fullScreen;
    RECT   windowedRect;
+   WINDOW_PROXY_ENTRY proxyWindows[winproxy::MAX_WINDOWS];
+   DWORD  proxyWindowCount;
+   DWORD  proxySequence;
 };
 
 static const COLORREF gc_trans              = RGB(255, 174, 201);
@@ -184,6 +188,126 @@ static BOOL RecvScreenPacket(SOCKET s, std::vector<BYTE>& packet)
       return FALSE;
    packet.resize((size_t) packetSize);
    return RecvAll(s, packet.data(), packetSize);
+}
+
+static BOOL TryParseWindowProxySnapshot(const std::vector<BYTE>& packet, const WINDOW_PROXY_HEADER **header, const WINDOW_PROXY_ENTRY **entries)
+{
+   if(header)
+      *header = NULL;
+   if(entries)
+      *entries = NULL;
+   if(packet.size() < sizeof(WINDOW_PROXY_HEADER) || !winproxy::IsSnapshotPacket(packet.data(), packet.size()))
+      return FALSE;
+
+   const WINDOW_PROXY_HEADER *h = (const WINDOW_PROXY_HEADER *) packet.data();
+   if(h->version != winproxy::PROTOCOL_VERSION ||
+      h->headerSize != sizeof(WINDOW_PROXY_HEADER) ||
+      h->entrySize != sizeof(WINDOW_PROXY_ENTRY) ||
+      h->windowCount > winproxy::MAX_WINDOWS)
+   {
+      return FALSE;
+   }
+
+   size_t expectedSize = sizeof(WINDOW_PROXY_HEADER) + sizeof(WINDOW_PROXY_ENTRY) * (size_t) h->windowCount;
+   if(expectedSize != packet.size() || expectedSize > winproxy::MAX_PACKET_SIZE)
+      return FALSE;
+
+   if(header)
+      *header = h;
+   if(entries)
+      *entries = (const WINDOW_PROXY_ENTRY *) (packet.data() + sizeof(WINDOW_PROXY_HEADER));
+   return TRUE;
+}
+
+static void UpdateClientWindowProxySnapshot(Client *client, const WINDOW_PROXY_HEADER *header, const WINDOW_PROXY_ENTRY *entries)
+{
+   if(!client || !header || !entries)
+      return;
+
+   DWORD count = header->windowCount;
+   if(count > winproxy::MAX_WINDOWS)
+      count = winproxy::MAX_WINDOWS;
+
+   EnterCriticalSection(&g_critSec);
+   client->proxyWindowCount = count;
+   client->proxySequence = header->sequence;
+   if(count)
+      memcpy(client->proxyWindows, entries, sizeof(WINDOW_PROXY_ENTRY) * count);
+   LeaveCriticalSection(&g_critSec);
+
+   if(header->sequence == 1 || (header->sequence % 5) == 0)
+   {
+      wprintf(TEXT("[winproxy] x64 snapshot seq=%lu windows=%lu flags=0x%lx\n"), header->sequence, count, header->flags);
+      DWORD logCount = count < 5 ? count : 5;
+      for(DWORD i = 0; i < logCount; ++i)
+      {
+         const WINDOW_PROXY_ENTRY *e = &entries[i];
+         wprintf(TEXT("[winproxy]   [%lu] hwnd=0x%I64x pid=%lu rect=(%ld,%ld,%ld,%ld) class='%ls' title='%ls'\n"),
+            i,
+            e->hwnd,
+            e->pid,
+            e->left,
+            e->top,
+            e->right,
+            e->bottom,
+            e->className,
+            e->title);
+      }
+   }
+
+   if(client->hWnd)
+      InvalidateRgn(client->hWnd, NULL, FALSE);
+}
+
+static void DrawWindowProxyOverlay(HDC hDc, Client *client)
+{
+   if(!hDc || !client || !client->proxyWindowCount || !client->screenWidth || !client->screenHeight || !client->pixelsWidth || !client->pixelsHeight)
+      return;
+
+   WINDOW_PROXY_ENTRY localWindows[winproxy::MAX_WINDOWS];
+   DWORD count = 0;
+   EnterCriticalSection(&g_critSec);
+   count = client->proxyWindowCount;
+   if(count > winproxy::MAX_WINDOWS)
+      count = winproxy::MAX_WINDOWS;
+   if(count)
+      memcpy(localWindows, client->proxyWindows, sizeof(WINDOW_PROXY_ENTRY) * count);
+   LeaveCriticalSection(&g_critSec);
+
+   if(!count)
+      return;
+
+   HPEN pen = CreatePen(PS_SOLID, 1, RGB(0, 255, 0));
+   HGDIOBJ oldPen = SelectObject(hDc, pen);
+   HGDIOBJ oldBrush = SelectObject(hDc, GetStockObject(HOLLOW_BRUSH));
+   COLORREF oldTextColor = SetTextColor(hDc, RGB(0, 255, 0));
+   int oldBkMode = SetBkMode(hDc, TRANSPARENT);
+
+   for(DWORD i = 0; i < count; ++i)
+   {
+      const WINDOW_PROXY_ENTRY *e = &localWindows[i];
+      if(e->right <= e->left || e->bottom <= e->top)
+         continue;
+
+      int left = (int) ((double) e->left * client->pixelsWidth / client->screenWidth);
+      int top = (int) ((double) e->top * client->pixelsHeight / client->screenHeight);
+      int right = (int) ((double) e->right * client->pixelsWidth / client->screenWidth);
+      int bottom = (int) ((double) e->bottom * client->pixelsHeight / client->screenHeight);
+
+      Rectangle(hDc, left, top, right, bottom);
+      WCHAR label[256] = { 0 };
+      if(e->title[0])
+         swprintf_s(label, L"%ls [0x%I64x]", e->title, e->hwnd);
+      else
+         swprintf_s(label, L"%ls [0x%I64x]", e->className, e->hwnd);
+      TextOutW(hDc, left + 2, top + 2, label, lstrlenW(label));
+   }
+
+   SetBkMode(hDc, oldBkMode);
+   SetTextColor(hDc, oldTextColor);
+   SelectObject(hDc, oldBrush);
+   SelectObject(hDc, oldPen);
+   DeleteObject(pen);
 }
 
 static BOOL SendInputMessage(SOCKET s, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -351,6 +475,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
          if(client && client->hDcBmp && client->pixelsWidth && client->pixelsHeight)
          {
             BitBlt(hDc, 0, 0, client->pixelsWidth, client->pixelsHeight, client->hDcBmp, 0, 0, SRCCOPY);
+            DrawWindowProxyOverlay(hDc, client);
          }
          else
          {
@@ -511,6 +636,14 @@ static DWORD WINAPI ClientThread(PVOID param)
          std::vector<BYTE> packet;
          if(!RecvScreenPacket(s, packet))
             goto exit;
+
+         const WINDOW_PROXY_HEADER *proxyHeader = NULL;
+         const WINDOW_PROXY_ENTRY *proxyEntries = NULL;
+         if(TryParseWindowProxySnapshot(packet, &proxyHeader, &proxyEntries))
+         {
+            UpdateClientWindowProxySnapshot(client, proxyHeader, proxyEntries);
+            continue;
+         }
 
          SCREEN_SIZE_MSG sizeMsg = {};
          if(screen2::TryParseScreenSizePacket(packet.data(), packet.size(), sizeMsg))

@@ -9,6 +9,7 @@
 #include <vector>
 #include <limits.h>
 #include "../common/ScreenTransfer/ScreenCodec.h"
+#include "../common/WindowProxyProtocol.h"
 #pragma comment (lib,"Gdiplus.Lib")
 using namespace Gdiplus;
 
@@ -48,6 +49,7 @@ static DWORD      g_lastDesktopDumpTick = 0;
 static BOOL       g_dumpedInputDesktopState = FALSE;
 static DWORD      g_lastCaptureHungSkipLogTick = 0;
 static DWORD      g_lastCaptureSlowPrintLogTick = 0;
+static DWORD      g_windowProxySequence = 1;
 static ULARGE_INTEGER lisize;
 static LARGE_INTEGER offset;
 
@@ -335,6 +337,188 @@ static void CloseProcessInformationHandles(PROCESS_INFORMATION *processInfo)
         processInfo->hProcess = NULL;
     }
 }
+
+#ifdef _WIN64
+static BOOL IsProcess64Bit(DWORD pid)
+{
+    BOOL wow64 = FALSE;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return FALSE;
+
+    BOOL ok = IsWow64Process(hProcess, &wow64);
+    CloseHandle(hProcess);
+    return ok && !wow64;
+}
+
+static void CopyWindowTextField(WCHAR *dst, DWORD dstCount, const WCHAR *src)
+{
+    if (!dst || !dstCount)
+        return;
+    dst[0] = 0;
+    if (src)
+        lstrcpynW(dst, src, dstCount);
+}
+
+static void GetProcessImageNameW(DWORD pid, WCHAR *image, DWORD imageCount)
+{
+    if (!image || !imageCount)
+        return;
+    image[0] = 0;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return;
+
+    DWORD size = imageCount;
+    QueryFullProcessImageNameW(hProcess, 0, image, &size);
+    CloseHandle(hProcess);
+}
+
+static BOOL IsWindowProxyEligible(HWND hWnd, DWORD *pidOut, DWORD *tidOut)
+{
+    if (!hWnd || !IsWindowVisible(hWnd))
+        return FALSE;
+
+    RECT rect = { 0 };
+    if (!GetWindowRect(hWnd, &rect) || rect.right <= rect.left || rect.bottom <= rect.top)
+        return FALSE;
+
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(hWnd, &pid);
+    if (!pid || !tid || !IsProcess64Bit(pid))
+        return FALSE;
+
+    if (pidOut)
+        *pidOut = pid;
+    if (tidOut)
+        *tidOut = tid;
+    return TRUE;
+}
+
+struct WindowProxyBuildContext
+{
+    WINDOW_PROXY_HEADER *header;
+    WINDOW_PROXY_ENTRY *entries;
+    DWORD count;
+    DWORD capacity;
+    DWORD skipped32BitOrUnknown;
+};
+
+static BOOL CALLBACK BuildWindowProxySnapshotEnumProc(HWND hWnd, LPARAM lParam)
+{
+    WindowProxyBuildContext *ctx = (WindowProxyBuildContext *)lParam;
+    if (!ctx || ctx->count >= ctx->capacity)
+        return FALSE;
+
+    DWORD pid = 0;
+    DWORD tid = 0;
+    if (!IsWindowProxyEligible(hWnd, &pid, &tid))
+    {
+        DWORD probePid = 0;
+        GetWindowThreadProcessId(hWnd, &probePid);
+        if (probePid && !IsProcess64Bit(probePid))
+            ++ctx->skipped32BitOrUnknown;
+        return TRUE;
+    }
+
+    WINDOW_PROXY_ENTRY *entry = &ctx->entries[ctx->count];
+    Funcs::pMemset(entry, 0, sizeof(*entry));
+    entry->hwnd = (unsigned long long)(ULONG_PTR)hWnd;
+    entry->owner = (unsigned long long)(ULONG_PTR)GetWindow(hWnd, GW_OWNER);
+    entry->parent = (unsigned long long)(ULONG_PTR)GetParent(hWnd);
+    entry->pid = pid;
+    entry->tid = tid;
+    entry->style = (DWORD)GetWindowLongPtrA(hWnd, GWL_STYLE);
+    entry->exStyle = (DWORD)GetWindowLongPtrA(hWnd, GWL_EXSTYLE);
+    entry->zOrder = ctx->count;
+    entry->stateFlags = 0;
+    if (IsWindowVisible(hWnd))
+        entry->stateFlags |= winproxy::STATE_VISIBLE;
+    if (IsWindowEnabled(hWnd))
+        entry->stateFlags |= winproxy::STATE_ENABLED;
+    if (IsIconic(hWnd))
+        entry->stateFlags |= winproxy::STATE_MINIMIZED;
+    if (IsZoomed(hWnd))
+        entry->stateFlags |= winproxy::STATE_MAXIMIZED;
+
+    RECT rect = { 0 };
+    GetWindowRect(hWnd, &rect);
+    entry->left = rect.left;
+    entry->top = rect.top;
+    entry->right = rect.right;
+    entry->bottom = rect.bottom;
+
+    WCHAR className[64] = { 0 };
+    WCHAR title[128] = { 0 };
+    GetClassNameW(hWnd, className, ARRAYSIZE(className));
+    GetWindowTextW(hWnd, title, ARRAYSIZE(title));
+    CopyWindowTextField(entry->className, ARRAYSIZE(entry->className), className);
+    CopyWindowTextField(entry->title, ARRAYSIZE(entry->title), title);
+    GetProcessImageNameW(pid, entry->imageName, ARRAYSIZE(entry->imageName));
+
+    ++ctx->count;
+    return TRUE;
+}
+
+static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *windowCount, DWORD *skippedCount)
+{
+    packet.clear();
+    if (windowCount)
+        *windowCount = 0;
+    if (skippedCount)
+        *skippedCount = 0;
+
+    const size_t totalSize = sizeof(WINDOW_PROXY_HEADER) + sizeof(WINDOW_PROXY_ENTRY) * winproxy::MAX_WINDOWS;
+    if (totalSize > winproxy::MAX_PACKET_SIZE)
+        return FALSE;
+    packet.assign(totalSize, 0);
+
+    WINDOW_PROXY_HEADER *header = (WINDOW_PROXY_HEADER *)packet.data();
+    WINDOW_PROXY_ENTRY *entries = (WINDOW_PROXY_ENTRY *)(packet.data() + sizeof(WINDOW_PROXY_HEADER));
+
+    WindowProxyBuildContext ctx = { 0 };
+    ctx.header = header;
+    ctx.entries = entries;
+    ctx.capacity = winproxy::MAX_WINDOWS;
+
+    SetLastError(0);
+    if (!EnumDesktopWindows(g_hDesk, BuildWindowProxySnapshotEnumProc, (LPARAM)&ctx))
+    {
+        DWORD err = GetLastError();
+        if (err)
+            printf("[winproxy] EnumDesktopWindows failed: GetLastError=%lu\n", err);
+    }
+
+    Funcs::pMemset(header, 0, sizeof(*header));
+    wcscpy_s(header->mark, L"WINPROXY_SNAPSHOT");
+    header->version = winproxy::PROTOCOL_VERSION;
+    header->headerSize = sizeof(WINDOW_PROXY_HEADER);
+    header->entrySize = sizeof(WINDOW_PROXY_ENTRY);
+    header->windowCount = ctx.count;
+    header->sequence = g_windowProxySequence++;
+    if (!g_windowProxySequence)
+        g_windowProxySequence = 1;
+    header->flags = winproxy::FLAG_X64_ONLY;
+
+    packet.resize(sizeof(WINDOW_PROXY_HEADER) + sizeof(WINDOW_PROXY_ENTRY) * ctx.count);
+    if (windowCount)
+        *windowCount = ctx.count;
+    if (skippedCount)
+        *skippedCount = ctx.skipped32BitOrUnknown;
+    return TRUE;
+}
+#else
+static BOOL BuildWindowProxySnapshotPacket(std::vector<BYTE>& packet, DWORD *windowCount, DWORD *skippedCount)
+{
+    packet.clear();
+    if (windowCount)
+        *windowCount = 0;
+    if (skippedCount)
+        *skippedCount = 0;
+    return FALSE;
+}
+#endif
 
 struct HitTestContext
 {
@@ -1417,6 +1601,8 @@ static DWORD WINAPI DesktopThread(LPVOID param)
     int normalAckWindows = 0;
     BOOL ackAdaptiveThrottleActive = FALSE;
     BOOL ackAdaptiveQualityActive = FALSE;
+    ULONGLONG lastWindowProxySnapshotTick = 0;
+    DWORD lastWindowProxyLogSequence = 0;
 
     if (!s)
     {
@@ -1470,6 +1656,30 @@ static DWORD WINAPI DesktopThread(LPVOID param)
             }
             lastSizeFrame = rawFrame;
             sizeSent = TRUE;
+        }
+
+        ULONGLONG nowForWindowProxy = GetTickCount64();
+        if (!lastWindowProxySnapshotTick || nowForWindowProxy - lastWindowProxySnapshotTick >= 1000)
+        {
+            std::vector<BYTE> proxyPacket;
+            DWORD proxyWindowCount = 0;
+            DWORD skippedProxyCount = 0;
+            if (BuildWindowProxySnapshotPacket(proxyPacket, &proxyWindowCount, &skippedProxyCount))
+            {
+                if (!SendScreenPacket(s, proxyPacket))
+                    goto exit;
+                const WINDOW_PROXY_HEADER *proxyHeader = (const WINDOW_PROXY_HEADER *)proxyPacket.data();
+                if (!lastWindowProxyLogSequence || proxyHeader->sequence - lastWindowProxyLogSequence >= 5)
+                {
+                    printf("[winproxy] sent x64 snapshot seq=%lu windows=%lu skipped32orUnknown=%lu bytes=%zu\n",
+                        proxyHeader->sequence,
+                        proxyWindowCount,
+                        skippedProxyCount,
+                        proxyPacket.size());
+                    lastWindowProxyLogSequence = proxyHeader->sequence;
+                }
+            }
+            lastWindowProxySnapshotTick = nowForWindowProxy;
         }
 
         std::vector<BYTE> framePacket;
